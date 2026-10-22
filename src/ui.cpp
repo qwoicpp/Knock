@@ -1171,6 +1171,7 @@ private:
         feedback_.clear();
         reset_tag_picker();
         note_page_ = page;
+        note_delete_click_until_ = 0;
         note_results_dirty_ = true;
         note_search_pending_ = false;
         note_search_page_offset_ = 0;
@@ -1805,6 +1806,7 @@ private:
             return;
         }
         if (!save_note_draft()) return;
+        feedback_.clear();
         note_edit_ = NoteEdit{get_string(entry, "id"), entry.value("revision", std::int64_t(0)),
             {get_string(entry, "text"), entry.at("images").get<std::vector<std::string>>(), {}}};
         populating_ = true;
