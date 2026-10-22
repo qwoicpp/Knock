@@ -1757,17 +1757,9 @@ private:
         note_find_pending_ = false;
         const auto query = trim(narrow(edit_text(note_find_edit_)));
         if (query.empty()) { layout(); return; }
-        std::size_t offset = 0;
-        for (;;) {
-            auto result = mutate({{"op", "note.search"}, {"id", detail_id_}, {"query", query},
-                                  {"offset", offset}, {"limit", 100}});
-            if (!result.value("ok", false)) { layout(); return; }
-            for (auto& item : result.at("items")) note_find_results_.push_back(std::move(item));
-            if (result.at("next_offset").is_null()) break;
-            const auto next = result.at("next_offset").get<std::size_t>();
-            if (next <= offset) throw std::runtime_error("Note search did not advance");
-            offset = next;
-        }
+        auto result = mutate({{"op", "note.search_locations"}, {"id", detail_id_}, {"query", query}});
+        if (!result.value("ok", false)) { layout(); return; }
+        for (auto& item : result.at("items")) note_find_results_.push_back(std::move(item));
         const auto previous = std::find_if(note_find_results_.begin(), note_find_results_.end(), [&previous_id](const auto& item) {
             return get_string(item, "message_id") == previous_id;
         });
