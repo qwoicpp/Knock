@@ -1563,6 +1563,9 @@ private:
         const auto& button = found->second;
         RECT bounds = item.rcItem;
         const bool terminal_tab = button.tab && button.icon != Icon::none;
+        RECT popup{};
+        if (terminal_tab) GetClientRect(window_, &popup);
+        const bool compact_tab = terminal_tab && popup.right < px(394);
         COLORREF bg = button.tab ? (button.active ? background : top_background) : background;
         if (button.hover || (button.active && !button.tab) || (item.itemState & ODS_SELECTED)) bg = RGB(31, 31, 29);
         COLORREF color = (item.itemState & ODS_DISABLED) ? subdued : foreground;
@@ -1578,7 +1581,7 @@ private:
             DeleteObject(brush);
             if (button.active) fill(item.hDC, RECT{0, bounds.bottom - px(2), bounds.right, bounds.bottom}, background);
             color = button.active || button.hover ? foreground : muted;
-            draw_tab_icon(item.hDC, button.icon, px(12), (bounds.bottom - px(14)) / 2, color);
+            draw_tab_icon(item.hDC, button.icon, px(compact_tab ? 8 : 12), (bounds.bottom - px(14)) / 2, color);
         } else fill(item.hDC, bounds, bg);
         if (!button.tab) outline(item.hDC, bounds, button.hover || (item.itemState & ODS_FOCUS) ? muted : border);
         if (button.note_result) {
@@ -1620,7 +1623,7 @@ private:
                      small_font_, subdued, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
             }
         } else {
-            if (terminal_tab) { bounds.left = px(33); bounds.right -= px(8); }
+            if (terminal_tab) { bounds.left = px(compact_tab ? 29 : 33); bounds.right -= px(compact_tab ? 6 : 8); }
             else if (button.left_aligned) { bounds.left = px(8); bounds.right -= px(8); }
             else InflateRect(&bounds, -px(3), 0);
             text(item.hDC, button.label, bounds, button.tab && !terminal_tab ? small_font_ : body_font_, color,
