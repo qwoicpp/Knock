@@ -57,8 +57,8 @@ Right-click anywhere in the popup and choose **Settings** to make it yours:
 
 You can also open Settings or quit Knock from the tray menu.
 
-**Settings → More** has saved replies, a busy timer, and how long deleted notes
-stay in Trash. Right-click anywhere and choose **Busy for...** to quiet banners
+**Settings → More** has saved replies, a quiet timer, and how long deleted notes
+stay in Trash. Right-click anywhere and choose **Quiet for...** to quiet banners
 for 15 minutes, 30 minutes, or an hour. Requests still wait in the inbox and keep
 their normal expiry. When the timer ends, Knock sends one inbox summary.
 
@@ -69,6 +69,23 @@ needed, then press **SEND**. Manage your own presets in Settings → More.
 
 To update, quit the running copy and replace its application files. Saved data
 lives separately, so your notes and tasks stay put.
+
+### Stepping away
+
+Click the status beneath the tabs, or choose **Status...** from the right-click
+or tray menu. Pick **At PC**, **Away**, or **Busy**, add a short message if you
+want, and press **SAVE**. I use things like “Out for coffee” or “In a meeting;
+headless tests are fine.” The first run says **SET STATUS** until you pick one.
+
+Agents get the status with their requests. While Away or Busy, a normal request
+stays in the inbox but returns immediately with the status and message, so the
+agent can do other work. A request already waiting does the same when the
+status changes to Away or Busy. Returning to At PC doesn't answer any requests
+or restart a chat; the usual Yes/No/Custom buttons still decide what happens.
+
+This is a manual setting. It survives restarting Knock and stays as set until
+you change it. It doesn't guess from mouse activity. The quiet timer is
+separate: it only silences notification banners.
 
 ### Notes
 
@@ -136,8 +153,10 @@ A request looks like this, from PowerShell in the Knock folder:
 ```
 
 The chat label tells you who's asking. You can answer **Yes**, **No**, or write
-your own reply. The command waits for that answer without model polling. Agents
-release the input lease with `knock.exe release REQUEST_ID` when they're done.
+your own reply. The command waits for that answer without model polling, unless
+the status is Away or Busy. Agents can also read the status with
+`knock.exe presence`. They release the input lease with
+`knock.exe release REQUEST_ID` when they're done.
 
 For a build you want to leave running:
 

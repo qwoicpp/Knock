@@ -6,7 +6,7 @@ Knock is a compact Windows tray app with a terminal-style interface. Native Win3
 
 ## Implementation
 
-Version 0.5.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
+Version 0.6.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
 `knock.exe`, and the `assets` directory together. There is no web runtime,
 server account, or network listener.
 
@@ -22,10 +22,25 @@ server account, or network listener.
   Only trusted UI calls may resolve requests. A custom reply never grants input.
 - Custom replies have up to 12 saved presets, managed in Settings → More.
   Choosing a preset only fills the editor; SEND submits the reply.
-- A persisted busy deadline suppresses banners for 15/30/60 minutes without
+- Manual presence is shown beneath the terminal tabs: At PC, Away, Busy, plus
+  an optional 500-byte UTF-8 message. The initial state is unknown until set.
+  The status editor is reachable from the strip and popup/tray menus; SAVE
+  applies both fields, BACK discards the draft, and incoming events never
+  reseed the editor. Presence survives restart and changes only through trusted
+  GUI calls. It is independent of input leases and notification preferences.
+- `knock presence` reads availability. Status and request create/result/wait
+  responses include it. Ordinary `knock request` passes stop_when_unavailable
+  to the condition-variable wait: Away/Busy returns pending, exit 7, with
+  wait_reason=presence and the same request ID. This also wakes an existing
+  implicit wait. Explicit `result --wait` keeps its chosen waiting budget.
+  Resolved decisions take precedence; presence never approves, denies, changes
+  expiry, or resumes a chat. Unset/At PC retain the normal wait behavior.
+- A persisted quiet deadline suppresses banners for 15/30/60 minutes without
   resolving requests or extending expiry. The app clears the deadline and sends
   one inbox summary when the timer ends. Right-click or the tray menu controls
   the timer; its status is shown above the popup content and in the tray tooltip.
+  The stored preference remains busy_until for compatibility; the interface
+  calls it Quiet to distinguish it from manual Busy presence.
 - The inbox filters by exact chat label from a card or CHATS selector. Pending
   requests sort first. Notification clicks clear the filter before opening the
   relevant request/result.

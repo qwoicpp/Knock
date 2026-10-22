@@ -1,10 +1,15 @@
-# Feature tracker — version 0.5.0
+# Feature tracker — version 0.6.0
 
 - [x] Windows tray lifecycle and popup with no taskbar icon flags
 - [x] Reference-matching Notifications, Task List, Notes
 - [x] Permission request Yes / No / Custom
 - [x] Saved custom-reply presets with add/edit/delete in Settings; selection never sends or approves
-- [x] Busy timer for 15/30/60 minutes, persisted across restarts, with one inbox summary when it ends
+- [x] Manual At PC / Away / Busy status, optional message, persistent across restarts; unset until first selection
+- [x] Compact status strip and dedicated editor accessible from popup/tray menus
+- [x] Read-only `knock presence`, presence in status/request responses, GUI-only updates
+- [x] Ordinary requests return pending immediately on Away/Busy; existing waits wake without granting permission
+- [x] Explicit `result --wait` retains its chosen budget regardless of presence
+- [x] Quiet notification timer for 15/30/60 minutes, persisted across restarts, with one inbox summary when it ends
 - [x] Chat-label and selector inbox filtering, with pending requests first
 - [x] Blocking CLI results, timeouts, cancellation, exclusive input lease
 - [x] Background command runner, captured output, completion notice and Copy
@@ -38,7 +43,7 @@
 - [x] Settings page with shortcut capture/disable and Start with Windows
 - [x] Configurable popup size: 360–800 × 360–1000 logical pixels; reset to 420 × 510
 - [x] Atomic window-size settings preserve shortcut and unrelated preferences
-- [x] Settings → More for saved replies, busy timers and Trash retention
+- [x] Settings → More for saved replies, quiet timers and Trash retention
 - [x] Hotkey opens a persistent topmost popup; ordinary tray opening hides on click-away
 - [x] Dark control initialization and layout repaint fix for tab-switch flash
 - [x] Bottom command-labelled buttons removed; Enter creates tasks and notes

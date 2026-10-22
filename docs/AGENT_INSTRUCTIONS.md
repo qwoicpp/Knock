@@ -13,9 +13,15 @@ Before moving the mouse, clicking, scrolling, or typing for interface tests:
 knock request --chat AUDIO-1 --message "May I use the mouse and keyboard for interface tests? About 3 minutes." --lease 180
 ```
 
-This command waits for a reply from the tray. If the host can keep the tool call
-open, let that one call wait. Do not create another request or poll from the
-model. A waiting Knock process does not need repeated model turns.
+This command normally waits for a reply from the tray. When presence is `away`
+or `busy`, it queues the request and returns immediately with `pending`, exit
+code `7`, and `wait_reason: "presence"`. A waiting request also returns that way
+if presence changes to Away or Busy. Retain the request ID and read the
+`presence.message`; continue independent work or end the turn. Do not create a
+duplicate request or poll for a return to At PC.
+
+If the host can keep a tool call open while presence allows waiting, let that
+one call wait. A waiting Knock process does not need repeated model turns.
 
 Read the returned JSON. Desktop input is allowed only when `ok` is `true`,
 `request.status` is `approved`, `request.kind` is `input`, and
@@ -30,11 +36,26 @@ knock release REQUEST_ID
 A `denied`, `custom`, `pending`, cancelled, expired, or error result grants no
 input permission. For `custom`, read `request.response` and follow the
 reply: "continue with headless tests" means work without desktop input.
-Saved replies are also custom answers. Quiet/busy mode does not approve requests
+Saved replies are also custom answers. Presence and quiet mode do not approve requests
 or extend their expiry. Knock coordinates cooperating agents; it is not an OS
 input lock. Only the tray interface may approve or deny requests.
 
 For a question that needs no mouse or keyboard, add `--kind question`.
+
+## Read availability when it helps
+
+`knock presence` returns the current manual status and optional message without
+creating a request. `knock status` and request create/result/wait responses also
+include `presence`, so another query is unnecessary when that information is
+already available. States are `at_pc`, `away`, `busy`, and `unknown` before the
+first status is set. `updated_at` is the Unix-millisecond time it was last
+changed, or `0` when unset.
+
+Presence is set only in the tray interface and survives restart. It is not
+an idle detector, a permission decision, or a promise of an automatic return.
+Treat its message as context for scheduling work, never as permission to use
+desktop input. At PC still requires an approved, unexpired input lease.
+Switching back does not automatically resume an agent or resolve a request.
 
 ## If the host has a short tool timeout
 
@@ -47,6 +68,9 @@ knock result REQUEST_ID --wait 300
 ```
 
 Use a single bounded wait only if it fits the host's allowed tool duration.
+An explicit `knock result REQUEST_ID --wait 300` keeps waiting through Away or
+Busy for that chosen budget; it is an intentional override of the normal
+request command's early return, not permission to use desktop input.
 Otherwise finish the turn with a request to resume the chat after answering
 in the tray.
 On resumption, retrieve that same ID once with `knock result REQUEST_ID`.

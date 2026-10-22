@@ -10,13 +10,27 @@ reference. Both commands take no arguments.
 
 All commands except help and info write one UTF-8 JSON object to standard output. Non-ASCII characters use JSON escapes so older PowerShell output encodings cannot damage them; JSON decoding restores the original text. Text fields are ordinary text, not commands. Every request, notice, and background job requires an explicit chat label such as `AUDIO-1` to identify the conversation to resume.
 
+## Availability
+
+```powershell
+knock presence
+```
+
+This returns `{ "ok": true, "presence": { "state": "away", "message": "Out for coffee", "updated_at": 1792641600000 } }` for an example Away status. The states are `at_pc`, `away`, `busy`, and `unknown` before a status is first set. `updated_at` is Unix milliseconds, or `0` when unset. The status is manual and persists across restarts until changed in the tray interface. There is no automatic idle detection or CLI setter.
+
+Click the status beneath the tabs or choose **Status...** from the popup or tray menu to change it. A message is optional and limited to 500 UTF-8 bytes. **SAVE** applies the status and message together; **BACK** discards the draft. Presence also appears in `knock status` and all successful request create/result/wait responses.
+
+Presence is advisory. It never grants or revokes a lease, answers a request, or changes an expiry. The **Quiet** notification timer is a separate setting. Returning to At PC does not resume a CLI agent automatically.
+
 ## Ask before using the desktop
 
 ```powershell
 knock request --chat AUDIO-1 --message "Permission to use mouse and keyboard for interface tests?" --lease 300
 ```
 
-This opens a request in the tray inbox and sends a native Windows notification. The command sleeps waiting for a reply from the tray; the model does not need to keep calling it. The default request timeout is 30 minutes. `--timeout` accepts 1–86400 seconds; `--lease` accepts 1–3600 seconds, with a five-minute default.
+This opens a request in the tray inbox and sends a native Windows notification unless banners are quiet. The command normally sleeps waiting for a reply from the tray; the model does not need to keep calling it. The default request timeout is 30 minutes. `--timeout` accepts 1–86400 seconds; `--lease` accepts 1–3600 seconds, with a five-minute default.
+
+While presence is Away or Busy, the ordinary request command returns immediately with the queued request, current `presence`, `wait_reason: "presence"`, and exit code `7`. The same applies when presence changes to Away or Busy while this command is waiting. The request remains pending with its original ID and expiry; it can still be answered later. Retain that ID, follow any relevant scheduling message, and continue independent work or end the turn instead of polling. At PC and an unset status preserve the normal waiting behavior.
 
 Yes produces an `approved` result. No produces `denied`. A typed reply produces `custom` with the exact reply text in `response`. A custom reply never grants desktop input automatically.
 
@@ -54,7 +68,7 @@ Or use a single blocking wait with a defined budget:
 knock result REQUEST_ID --wait 300
 ```
 
-A wait budget expiring returns `pending` if the request itself is still live. It never invents an answer. Cancel an unwanted pending request with `knock cancel REQUEST_ID`.
+A wait budget expiring returns `pending` if the request itself is still live. An explicit `result --wait` continues through Away or Busy for its chosen budget. Neither outcome invents an answer. Cancel an unwanted pending request with `knock cancel REQUEST_ID`.
 
 ### Request exit codes
 
@@ -66,7 +80,7 @@ A wait budget expiring returns `pending` if the request itself is still live. It
 | `4` | Expired or released; no valid input permission. |
 | `5` | Validation, storage, process, or connection error. |
 | `6` | Cancelled. |
-| `7` | Still pending after a result query or wait budget. |
+| `7` | Still pending after a result query, wait budget, or an ordinary request returning for Away/Busy presence. |
 
 Creating a detached request successfully returns `0` for the creation operation; its JSON status is still `pending`. That exit code is not permission. Other successful non-request commands also return `0`.
 
