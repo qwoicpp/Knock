@@ -217,7 +217,7 @@ private:
     enum class Tab { notifications, tasks, notes };
     enum class Detail { none, task, note };
     enum class SaveIntent { explicit_action, background };
-    enum class SettingsPage { general, preferences, replies, reply };
+    enum class SettingsPage { general, preferences, replies, reply, presence };
     enum class NotePage { list, find, remove, trash, search };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
@@ -282,7 +282,11 @@ private:
     HWND settings_height_edit_ = nullptr;
     HWND settings_retention_edit_ = nullptr;
     HWND settings_reply_edit_ = nullptr;
+    HWND settings_presence_edit_ = nullptr;
     SettingsPage settings_page_ = SettingsPage::general;
+    SettingsPage presence_return_page_ = SettingsPage::general;
+    bool presence_return_settings_ = false;
+    std::string presence_draft_state_;
     int saved_reply_index_ = -1;
     int saved_reply_offset_ = 0;
     HWND footer_edit_ = nullptr;
@@ -356,6 +360,8 @@ private:
     std::map<std::string, std::string> drafts_;
     std::string inbox_chat_;
     int inbox_bar_y_ = 0;
+    int presence_bar_y_ = 0;
+    int lease_bar_y_ = 0;
     int busy_bar_y_ = 0;
     bool busy_was_active_ = false;
     bool busy_summary_pending_ = false;
@@ -393,7 +399,8 @@ private:
         small_font_ = make(10, FW_NORMAL);
         title_font_ = make(13, FW_NORMAL);
         for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_,
-                          settings_width_edit_, settings_height_edit_, settings_retention_edit_, settings_reply_edit_, note_query_edit_, note_find_edit_})
+                          settings_width_edit_, settings_height_edit_, settings_retention_edit_, settings_reply_edit_, settings_presence_edit_,
+                          note_query_edit_, note_find_edit_})
             if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), TRUE);
     }
     void text(HDC dc, const std::wstring& value, RECT bounds, HFONT font,
@@ -432,11 +439,27 @@ private:
         const auto found = snapshot_.find("preferences");
         return found != snapshot_.end() && found->is_object() ? *found : empty;
     }
+    const Json& presence() const {
+        static const Json empty = Json::object();
+        const auto found = snapshot_.find("presence");
+        return found != snapshot_.end() && found->is_object() ? *found : empty;
+    }
+    std::wstring presence_caption() const {
+        const auto state = get_string(presence(), "state");
+        return state == "at_pc" ? L"AT PC" : state == "away" ? L"AWAY" : state == "busy" ? L"BUSY" : L"SET STATUS";
+    }
+    std::wstring presence_message() const {
+        const auto message = get_string(presence(), "message");
+        if (!message.empty()) return widen(message);
+        const auto state = get_string(presence(), "state");
+        return state == "at_pc" ? L"At the PC" : state == "away" ? L"Away from the PC" :
+            state == "busy" ? L"Busy right now" : L"No status set";
+    }
     std::int64_t busy_deadline() const { return preferences().value("busy_until", std::int64_t(0)); }
     bool busy() const { return busy_deadline() > now_ms(); }
     std::wstring busy_caption() const {
         const auto minutes = std::max<std::int64_t>(1, (busy_deadline() - now_ms() + 59999) / 60000);
-        return L"BUSY · " + std::to_wstring(minutes) + L"m remaining";
+        return L"QUIET · " + std::to_wstring(minutes) + L"m remaining";
     }
     bool save_preferences(Json changes) {
         changes["op"] = "preferences.update";
@@ -464,7 +487,7 @@ private:
             if (!job.value("archived", false) && get_string(job, "status") != "running") ++results;
         Banner summary;
         summary.inbox = true;
-        summary.title = L"Knock - busy timer finished";
+        summary.title = L"Knock - quiet timer finished";
         summary.text = std::to_wstring(requests) + L" pending request(s), " + std::to_wstring(results) +
             L" finished result(s) in the inbox.";
         banners_.push_back(std::move(summary));
@@ -503,8 +526,8 @@ private:
         layout();
     }
     void busy_menu(POINT point) {
-        const std::vector<MenuItem> items{{31, L"Busy for 15 minutes"}, {32, L"Busy for 30 minutes"},
-            {33, L"Busy for 1 hour"}, {34, L"End busy mode", busy()}};
+        const std::vector<MenuItem> items{{31, L"Quiet for 15 minutes"}, {32, L"Quiet for 30 minutes"},
+            {33, L"Quiet for 1 hour"}, {34, L"End quiet mode", busy()}};
         const int selected = popup_menu(point, items);
         if (selected >= 31 && selected <= 34) {
             const int minutes[]{15, 30, 60, 0};
@@ -582,6 +605,7 @@ private:
         data.uID = 1;
         data.uFlags = NIF_TIP;
         auto tip = pending ? L"Knock - " + std::to_wstring(pending) + L" pending request(s)" : L"Knock - agent inbox";
+        if (get_string(presence(), "state", "unknown") != "unknown") tip += L" - " + presence_caption();
         if (busy()) tip += L" - " + busy_caption();
         wcsncpy_s(data.szTip, tip.c_str(), _TRUNCATE);
         Shell_NotifyIconW(NIM_MODIFY, &data);
@@ -770,14 +794,15 @@ private:
         GetCursorPos(&point);
         const std::vector<MenuItem> items{
             {1, L"Open Knock"}, {2, L"Settings..."},
-            {6, busy() ? busy_caption() : L"Busy for..."},
+            {6, busy() ? busy_caption() : L"Quiet notifications..."},
             {3, startup_enabled() ? L"[x] Start with Windows" : L"[ ] Start with Windows"},
-            {4, L"Open data folder"}, {0, L"", false, true}, {5, L"Quit"}
+            {4, L"Open data folder"}, {7, L"Status..."}, {0, L"", false, true}, {5, L"Quit"}
         };
         int selected = popup_menu(point, items);
         if (selected == 1) show();
         if (selected == 2) { show(); open_settings(); }
         if (selected == 6) busy_menu(point);
+        if (selected == 7) { show(); open_presence(); }
         if (selected == 3) { toggle_startup(); layout(); }
         if (selected == 4) ShellExecuteW(window_, L"open", data_directory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if (selected == 5 && settings_open_) close_settings();
@@ -825,12 +850,15 @@ private:
     }
     void close_settings() {
         if (!settings_open_) return;
-        for (HWND* edit : {&settings_width_edit_, &settings_height_edit_, &settings_retention_edit_, &settings_reply_edit_}) {
+        for (HWND* edit : {&settings_width_edit_, &settings_height_edit_, &settings_retention_edit_, &settings_reply_edit_,
+                           &settings_presence_edit_}) {
             if (*edit) DestroyWindow(*edit);
             *edit = nullptr;
         }
         settings_open_ = false;
         settings_page_ = SettingsPage::general;
+        presence_return_settings_ = false;
+        presence_draft_state_.clear();
         feedback_.clear();
         layout();
         SetFocus(IsWindow(settings_return_focus_) && IsWindowVisible(settings_return_focus_)
@@ -842,17 +870,68 @@ private:
             DestroyWindow(settings_reply_edit_);
             settings_reply_edit_ = nullptr;
         }
+        if (settings_presence_edit_ && page != SettingsPage::presence) {
+            DestroyWindow(settings_presence_edit_);
+            settings_presence_edit_ = nullptr;
+            presence_draft_state_.clear();
+        }
         settings_page_ = page;
         feedback_.clear();
         layout();
         SetFocus(page == SettingsPage::general ? settings_width_edit_ :
-            page == SettingsPage::preferences ? settings_retention_edit_ : window_);
+            page == SettingsPage::preferences ? settings_retention_edit_ :
+            page == SettingsPage::reply ? settings_reply_edit_ : window_);
     }
     void settings_back() {
-        if (settings_page_ == SettingsPage::reply) settings_page(SettingsPage::replies);
+        if (settings_page_ == SettingsPage::presence) {
+            if (presence_return_settings_) {
+                presence_return_settings_ = false;
+                settings_page(presence_return_page_);
+            } else close_settings();
+        }
+        else if (settings_page_ == SettingsPage::reply) settings_page(SettingsPage::replies);
         else if (settings_page_ == SettingsPage::replies) settings_page(SettingsPage::preferences);
         else if (settings_page_ == SettingsPage::preferences) settings_page(SettingsPage::general);
         else close_settings();
+    }
+    void open_presence() {
+        if (settings_open_ && settings_page_ == SettingsPage::presence) {
+            SetFocus(settings_presence_edit_);
+            return;
+        }
+        const bool from_settings = settings_open_;
+        const auto previous_page = settings_page_;
+        open_settings();
+        if (!settings_open_) return;
+        presence_return_settings_ = from_settings;
+        presence_return_page_ = previous_page;
+        presence_draft_state_ = get_string(presence(), "state", "unknown");
+        settings_presence_edit_ = make_edit(content_, 45, false, L"Out for coffee...");
+        SendMessageW(settings_presence_edit_, EM_SETLIMITTEXT, 500, 0);
+        // Seed once. Incoming activity must not replace a draft, including an empty one.
+        SetWindowTextW(settings_presence_edit_, widen(get_string(presence(), "message")).c_str());
+        settings_page_ = SettingsPage::presence;
+        feedback_.clear();
+        layout();
+        SetFocus(settings_presence_edit_);
+    }
+    void save_presence() {
+        if (!settings_presence_edit_) return;
+        if (presence_draft_state_ != "at_pc" && presence_draft_state_ != "away" && presence_draft_state_ != "busy") {
+            feedback(L"Choose At PC, Away, or Busy first.");
+            return;
+        }
+        const auto message = narrow(edit_text(settings_presence_edit_));
+        if (message.size() > 500) {
+            feedback(L"This message is too long (maximum 500 UTF-8 bytes).");
+            return;
+        }
+        const auto result = mutate({{"op", "presence.update"}, {"state", presence_draft_state_}, {"message", message}});
+        if (!result.value("ok", false)) return;
+        snapshot_["presence"] = result.at("presence");
+        update_tray();
+        settings_back();
+        feedback(L"Status saved.");
     }
     std::vector<std::string> saved_replies() const {
         return preferences().value("saved_replies", std::vector<std::string>{});
@@ -932,6 +1011,7 @@ private:
         if (target == settings_width_edit_ || target == settings_height_edit_) apply_window_size();
         else if (target == settings_retention_edit_) apply_trash_retention();
         else if (target == settings_reply_edit_ && GetKeyState(VK_CONTROL) < 0) save_saved_reply();
+        else if (target == settings_presence_edit_) save_presence();
         else return false;
         return true;
     }
@@ -1963,7 +2043,7 @@ private:
             point = POINT{bounds.left + px(12), bounds.top + px(12)};
         }
         std::vector<MenuItem> items{{1, L"Settings...", !settings_open_}, {2, L"Hide Knock"},
-            {3, busy() ? busy_caption() : L"Busy for..."}};
+            {3, busy() ? busy_caption() : L"Quiet notifications..."}, {4, L"Status..."}};
         if (!settings_open_ && detail_ == Detail::note) items.push_back({24, L"Find in note...  Ctrl+F"});
         wchar_t class_name[16]{};
         GetClassNameW(source, class_name, 16);
@@ -2007,6 +2087,7 @@ private:
         if (selected == 1) open_settings();
         if (selected == 2) hide();
         if (selected == 3) busy_menu(point);
+        if (selected == 4) open_presence();
         if (selected >= 10 && selected <= 14 && IsWindow(source)) {
             SetFocus(source);
             const UINT commands[]{EM_UNDO, WM_CUT, WM_COPY, WM_PASTE, EM_SETSEL};
@@ -2264,8 +2345,17 @@ private:
             tab_x += tab_width + px(4);
         }
         int top = px(44);
+        presence_bar_y_ = 0;
+        if (!settings_open_) {
+            presence_bar_y_ = top;
+            button("presence", window_, presence_caption(), rect(px(12), top, px(96), px(20)),
+                   [this] { open_presence(); });
+            top += px(24);
+        }
         bool has_lease = snapshot_.contains("lease") && !snapshot_["lease"].is_null();
+        lease_bar_y_ = 0;
         if (has_lease) {
+            lease_bar_y_ = top;
             button("release", window_, L"RELEASE", rect(width - px(80), top, px(68), px(20)), [this] {
                 if (!snapshot_["lease"].is_null()) mutate({{"op", "request.release"}, {"id", snapshot_["lease"]["id"]}});
             });
@@ -2379,8 +2469,29 @@ private:
             if (edit) ShowWindow(edit, settings_page_ == SettingsPage::general ? SW_SHOW : SW_HIDE);
         if (settings_retention_edit_) ShowWindow(settings_retention_edit_, settings_page_ == SettingsPage::preferences ? SW_SHOW : SW_HIDE);
         if (settings_reply_edit_) ShowWindow(settings_reply_edit_, settings_page_ == SettingsPage::reply ? SW_SHOW : SW_HIDE);
+        if (settings_presence_edit_) ShowWindow(settings_presence_edit_, settings_page_ == SettingsPage::presence ? SW_SHOW : SW_HIDE);
         button("settings-back", content_, L"< BACK", rect(0, px(2), px(68), px(22)), [this] { settings_back(); });
+        if (settings_page_ == SettingsPage::presence) {
+            const char* states[]{"at_pc", "away", "busy"};
+            const wchar_t* labels[]{L"AT PC", L"AWAY", L"BUSY"};
+            const int choice_width = (area.right - px(12)) / 3;
+            for (int i = 0; i < 3; ++i) {
+                const std::string state = states[i];
+                button("presence-state:" + state, content_, labels[i],
+                    rect(i * (choice_width + px(6)), px(64), choice_width, px(26)),
+                    [this, state] { presence_draft_state_ = state; feedback_.clear(); layout(); },
+                    true, false, presence_draft_state_ == state);
+            }
+            MoveWindow(settings_presence_edit_, px(4), px(131), area.right - px(8), px(23), FALSE);
+            ShowWindow(settings_presence_edit_, SW_SHOW);
+            button("presence-save", content_, L"SAVE", rect(0, area.bottom - px(29), px(62), px(23)),
+                   [this] { save_presence(); }, presence_draft_state_ == "at_pc" ||
+                   presence_draft_state_ == "away" || presence_draft_state_ == "busy");
+            return;
+        }
         if (settings_page_ == SettingsPage::preferences) {
+            button("settings-presence", content_, L"STATUS", rect(area.right - px(76), px(2), px(76), px(22)),
+                   [this] { open_presence(); });
             button("settings-replies", content_, L"MANAGE", rect(area.right - px(82), px(53), px(82), px(23)),
                    [this] { settings_page(SettingsPage::replies); });
             button("settings-busy", content_, busy() ? L"CHANGE" : L"SET TIMER", rect(area.right - px(82), px(111), px(82), px(23)),
@@ -2440,14 +2551,30 @@ private:
     void draw_settings(HDC dc, RECT area) {
         const auto heading = settings_page_ == SettingsPage::general ? L"SETTINGS" :
             settings_page_ == SettingsPage::preferences ? L"PREFERENCES" :
+            settings_page_ == SettingsPage::presence ? L"STATUS" :
             settings_page_ == SettingsPage::replies ? L"SAVED REPLIES" : saved_reply_index_ < 0 ? L"NEW REPLY" : L"EDIT REPLY";
-        text(dc, heading, RECT{px(82), px(2), area.right - px(settings_page_ == SettingsPage::general ? 82 : settings_page_ == SettingsPage::replies ? 66 : 0), px(24)}, title_font_, foreground,
+        text(dc, heading, RECT{px(82), px(2), area.right - px(settings_page_ == SettingsPage::general ||
+            settings_page_ == SettingsPage::preferences ? 82 : settings_page_ == SettingsPage::replies ? 66 : 0), px(24)}, title_font_, foreground,
              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         fill(dc, RECT{0, px(34), area.right, px(34) + 1}, border);
+        if (settings_page_ == SettingsPage::presence) {
+            text(dc, L"AVAILABILITY", RECT{0, px(43), area.right, px(59)}, small_font_, muted, DT_SINGLELINE);
+            text(dc, L"MESSAGE (OPTIONAL)", RECT{0, px(109), area.right, px(125)}, small_font_, muted, DT_SINGLELINE);
+            outline(dc, RECT{0, px(128), area.right, px(157)}, border);
+            text(dc, L"Agents can check this status.\nInput still needs approval.",
+                 RECT{0, px(173), area.right, px(198)}, small_font_, muted, DT_WORDBREAK | DT_NOPREFIX);
+            text(dc, L"Quiet notifications uses its own timer.",
+                 RECT{0, px(201), area.right, px(217)}, small_font_, subdued, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            const bool showing_feedback = !feedback_.empty() && GetTickCount64() < feedback_until_;
+            text(dc, showing_feedback ? feedback_ : L"Enter to save. Back discards changes.",
+                 RECT{0, area.bottom - px(54), area.right, area.bottom - px(32)}, small_font_, showing_feedback ? orange : subdued,
+                 DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+            return;
+        }
         if (settings_page_ == SettingsPage::preferences) {
             text(dc, L"SAVED REPLIES", RECT{0, px(43), area.right - px(94), px(62)}, small_font_, muted, DT_SINGLELINE);
             text(dc, std::to_wstring(saved_replies().size()) + L" replies", RECT{0, px(65), area.right - px(94), px(84)}, body_font_, foreground, DT_SINGLELINE);
-            text(dc, L"BUSY TIMER", RECT{0, px(101), area.right - px(94), px(120)}, small_font_, muted, DT_SINGLELINE);
+            text(dc, L"QUIET TIMER", RECT{0, px(101), area.right - px(94), px(120)}, small_font_, muted, DT_SINGLELINE);
             text(dc, busy() ? busy_caption() : L"Banners are on", RECT{0, px(124), area.right - px(94), px(144)}, small_font_, foreground, DT_SINGLELINE | DT_END_ELLIPSIS);
             text(dc, L"KEEP DELETED NOTES", RECT{0, px(169), area.right, px(187)}, small_font_, muted, DT_SINGLELINE);
             outline(dc, rect(0, px(195), px(66), px(27)), border);
@@ -2755,9 +2882,12 @@ private:
         fill(dc, area, background);
         fill(dc, RECT{1, 1, area.right - 1, px(34)}, top_background);
         outline(dc, area, border);
-        if (snapshot_.contains("lease") && !snapshot_["lease"].is_null()) {
+        if (presence_bar_y_) text(dc, presence_message(),
+            RECT{px(118), presence_bar_y_, area.right - px(12), presence_bar_y_ + px(20)}, small_font_, muted,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (lease_bar_y_) {
             auto label = L"INPUT IN USE: @" + widen(get_string(snapshot_["lease"], "chat"));
-            text(dc, label, RECT{px(12), px(45), area.right - px(87), px(65)}, small_font_, orange,
+            text(dc, label, RECT{px(12), lease_bar_y_, area.right - px(87), lease_bar_y_ + px(20)}, small_font_, orange,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
         if (busy_bar_y_) text(dc, busy_caption(),
@@ -3515,6 +3645,7 @@ private:
              window == app->note_find_edit_ ||
              window == app->settings_width_edit_ || window == app->settings_height_edit_ || GetKeyState(VK_CONTROL) < 0 ||
              window == app->settings_retention_edit_ ||
+             window == app->settings_presence_edit_ ||
              (window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0))))) return 0;
         if (message == WM_CHAR && wparam == 0x06 && app->detail_ == Detail::note) return 0;
         return DefSubclassProc(window, message, wparam, lparam);
