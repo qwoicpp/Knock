@@ -586,8 +586,9 @@ int main() {
         eventually([&] { return edit(app.root, 37) != nullptr; }, "blank conversation composer");
         const auto working_id = state()["notes"].back()["id"].get<std::string>();
         auto composer = edit(app.root, 37);
-        require(focus_of(app.root) == composer && window_text(composer).empty(),
-                "Opening a new conversation did not focus its blank composer");
+        // The HWND exists before the posted Enter finishes layout and focus.
+        eventually([&] { return focus_of(app.root) == composer && window_text(composer).empty(); },
+                   "opening a new conversation focuses its blank composer");
         require(!edit(app.root, 31) && !edit(app.root, 32) && saved_note(working_id)["messages"].empty(),
                 "New conversation contains placeholder content or old note editors");
         const auto sent_text = knock::widen("A useful website: https://example.com/\r\nCafé — 日本語 ✓");
