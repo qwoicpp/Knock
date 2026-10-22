@@ -6,10 +6,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using knock::Json;
@@ -197,12 +199,69 @@ void archive(const Json& request) {
     send({{"op", "item.dismiss"}, {"kind", "request"}, {"id", request.at("id")}});
 }
 
-HWND focus_of(HWND root) {
+GUITHREADINFO gui_thread_info(HWND root) {
     GUITHREADINFO info{};
     info.cbSize = sizeof(info);
     const auto thread = GetWindowThreadProcessId(root, nullptr);
-    require(GetGUIThreadInfo(thread, &info) != 0, "Cannot inspect GUI focus");
-    return info.hwndFocus;
+    require(GetGUIThreadInfo(thread, &info) != 0, "Cannot inspect GUI thread");
+    return info;
+}
+
+HWND focus_of(HWND root) { return gui_thread_info(root).hwndFocus; }
+
+void choose_context_item(HWND root, HWND source, std::initializer_list<UINT> keys) {
+    require(source == root || IsChild(root, source), "Context menu source is outside the test app");
+    const auto ui_thread = GetWindowThreadProcessId(root, nullptr);
+    HWND menu_owner = nullptr;
+    require(PostMessageW(source, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(source), -1) != 0,
+            "Could not open the chosen control's context menu");
+    try {
+        eventually([&] {
+            const auto info = gui_thread_info(root);
+            menu_owner = info.hwndMenuOwner;
+            return (info.flags & GUI_INMENUMODE) && menu_owner &&
+                   GetWindowThreadProcessId(menu_owner, nullptr) == ui_thread;
+        }, "native context menu opens");
+        // TrackPopupMenu has its own modal loop. Post only to this app's
+        // menu owner so the real menu processes navigation and selection.
+        for (UINT key : keys)
+            require(PostMessageW(menu_owner, WM_KEYDOWN, key, 1) != 0, "Could not navigate the test popup menu");
+        eventually([&] { return !(gui_thread_info(root).flags & GUI_INMENUMODE); }, "native context menu closes");
+        message(root, WM_NULL);
+    } catch (...) {
+        PostMessageW(root, WM_CANCELMODE, 0, 0);
+        throw;
+    }
+}
+
+void open_settings(HWND root, HWND source) {
+    choose_context_item(root, source, {VK_HOME, VK_RETURN});
+    eventually([&] { return IsWindowVisible(edit(root, 41)) && IsWindowVisible(edit(root, 42)); },
+               "Settings opens from the context menu");
+}
+
+void back_from_settings(HWND root) {
+    click(button(root, L"< BACK"));
+    eventually([&] { return !edit(root, 41) && !edit(root, 42); }, "Back closes Settings");
+}
+
+HWND shortcut_dialog(HWND root) {
+    require(PostMessageW(button(root, L"CHANGE"), BM_CLICK, 0, 0) != 0,
+            "Could not open the shortcut dialog");
+    HWND dialog = nullptr;
+    eventually([&] {
+        dialog = FindWindowW(L"Knock.Shortcut.v1", nullptr);
+        if (!dialog) return false;
+        DWORD owner = 0;
+        GetWindowThreadProcessId(dialog, &owner);
+        DWORD expected = 0;
+        GetWindowThreadProcessId(root, &expected);
+        require(owner == expected && GetWindow(dialog, GW_OWNER) == root,
+                "Refusing to control another app's shortcut dialog");
+        return IsWindowVisible(dialog) && buttons(dialog, L"CANCEL").size() == 1;
+    }, "Settings CHANGE opens the shortcut dialog");
+    require(!IsWindowEnabled(root), "Shortcut dialog did not disable its owner");
+    return dialog;
 }
 
 RECT screen_rect(HWND window) {
@@ -366,6 +425,98 @@ int main() {
         eventually([&] { return IsWindowVisible(app.root); }, "restore pinned popup for remaining checks");
         passed("shortcut toggles a topmost popup that stays open on focus loss; ordinary opens stay transient");
 
+        const auto content = FindWindowExW(app.root, nullptr, L"Knock.Content.v1", nullptr);
+        require(content != nullptr, "App content window is missing");
+        for (HWND source : {app.root, content, note_tab}) {
+            open_settings(app.root, source);
+            require(window_text(edit(app.root, 41)) == L"420" && window_text(edit(app.root, 42)) == L"510",
+                    "Settings did not show the default window dimensions");
+            require(buttons(app.root, L"CHANGE").size() == 1 && buttons(app.root, L"APPLY").size() == 1 &&
+                    buttons(app.root, L"RESET").size() == 1 &&
+                    buttons(app.root, L"[ ] Start with Windows").size() +
+                    buttons(app.root, L"[x] Start with Windows").size() == 1,
+                    "Settings is missing its shortcut, size, or startup controls");
+            back_from_settings(app.root);
+        }
+        require(button(app.root, L"Notifications") == notification_tab && button(app.root, L"Notes") == note_tab,
+                "Opening Settings recreated terminal tabs");
+        passed("native context menus on the popup, content background, and terminal tab open Settings");
+
+        const auto settings_path = app.directory / L"settings.json";
+        const auto preferences = [&] {
+            return std::filesystem::exists(settings_path) ? read_json(settings_path) : Json::object();
+        };
+        const auto original_preferences = preferences();
+        const auto original_size = screen_rect(app.root);
+        open_settings(app.root, content);
+        const auto width_edit = edit(app.root, 41);
+        const auto height_edit = edit(app.root, 42);
+        for (const auto& [width, height] : std::array<std::pair<std::wstring, std::wstring>, 3>{
+                 {{L"", L"620"}, {L"359", L"620"}, {L"500", L"1001"}}}) {
+            set_text(width_edit, width);
+            set_text(height_edit, height);
+            click(button(app.root, L"APPLY"));
+            require(same_rect(original_size, screen_rect(app.root)) && preferences() == original_preferences,
+                    "Invalid dimensions resized the popup or changed saved preferences");
+            require(window_text(width_edit) == width && window_text(height_edit) == height,
+                    "Validation discarded the dimensions being corrected");
+        }
+        set_text(width_edit, L"500");
+        set_text(height_edit, L"620");
+        click(button(app.root, L"APPLY"));
+        require(preferences().at("window") == Json{{"width", 500}, {"height", 620}} &&
+                !same_rect(original_size, screen_rect(app.root)),
+                "Apply did not save and display the chosen window size");
+        set_text(width_edit, L"615");
+        set_text(height_edit, L"630");
+        const auto dimensions_focus = focus_of(app.root);
+        const auto settings_notice = send({{"op", "notify"}, {"chat", "GUI-SETTINGS"},
+                                          {"message", "Incoming state while dimensions are being edited."}}).at("job");
+        std::this_thread::sleep_for(200ms);
+        message(app.root, WM_NULL);
+        require(edit(app.root, 41) == width_edit && edit(app.root, 42) == height_edit &&
+                window_text(width_edit) == L"615" && window_text(height_edit) == L"630",
+                "An incoming state update replaced pending Settings fields");
+        require(focus_of(app.root) == dimensions_focus, "An incoming state update changed Settings focus");
+        send({{"op", "item.dismiss"}, {"kind", "job"}, {"id", settings_notice["id"]}});
+        back_from_settings(app.root);
+        open_settings(app.root, content);
+        require(window_text(edit(app.root, 41)) == L"500" && window_text(edit(app.root, 42)) == L"620",
+                "Reopening Settings did not use the last applied dimensions");
+        passed("Settings validates dimensions, applies the size, and preserves pending inputs through incoming state");
+
+        const auto saved_size_preferences = preferences();
+        const auto pending_width = edit(app.root, 41);
+        set_text(pending_width, L"615");
+        auto shortcut = shortcut_dialog(app.root);
+        click(button(shortcut, L"DISABLE"));
+        require(window_text(GetDlgItem(shortcut, 101)) == L"Disabled", "Disable did not update the shortcut draft");
+        click(button(shortcut, L"CANCEL"));
+        eventually([&] { return !IsWindow(shortcut) && IsWindowEnabled(app.root); }, "Cancel returns to Settings");
+        require(preferences() == saved_size_preferences && edit(app.root, 41) == pending_width &&
+                window_text(pending_width) == L"615",
+                "Cancel saved a shortcut change or replaced pending dimensions");
+        shortcut = shortcut_dialog(app.root);
+        click(button(shortcut, L"DISABLE"));
+        click(button(shortcut, L"SAVE"));
+        eventually([&] { return !IsWindow(shortcut) && IsWindowEnabled(app.root); }, "Save returns to Settings");
+        require(preferences().at("shortcut") == Json{{"enabled", false}, {"modifiers", 0}, {"key", 0}} &&
+                preferences().at("window") == saved_size_preferences.at("window"),
+                "Shortcut Save failed or changed the window preferences");
+        click(button(app.root, L"RESET"));
+        require(window_text(edit(app.root, 41)) == L"420" && window_text(edit(app.root, 42)) == L"510" &&
+                same_rect(original_size, screen_rect(app.root)) &&
+                preferences().at("window") == Json{{"width", 420}, {"height", 510}} &&
+                !preferences().at("shortcut").at("enabled").get<bool>(),
+                "Reset did not restore the default size while keeping the shortcut preference");
+        const auto expected_preferences = preferences();
+        back_from_settings(app.root);
+        choose_context_item(app.root, app.root, {VK_HOME, VK_DOWN, VK_RETURN});
+        eventually([&] { return !IsWindowVisible(app.root); }, "context menu Hide Knock hides popup");
+        message(app.root, WM_APP + 20);
+        eventually([&] { return IsWindowVisible(app.root); }, "reopen after Hide Knock");
+        passed("Settings CHANGE opens shortcut controls; Cancel, Save, size Reset, and context Hide work");
+
         auto denied = create_request("GUI-NO");
         eventually([&] { return buttons(app.root, L"NO").size() == 1; }, "denial controls");
         click(button(app.root, L"NO"));
@@ -475,6 +626,19 @@ int main() {
 
         const auto external_draft = knock::widen("Still thinking about this\r\nUnsent — 日本語");
         set_text(composer, external_draft);
+        choose_context_item(app.root, composer, {VK_END, VK_RETURN});
+        const auto selection = message(composer, EM_GETSEL);
+        require(LOWORD(selection) == 0 && HIWORD(selection) == external_draft.size(),
+                "The edit context menu lost its native Select all action");
+        open_settings(app.root, composer);
+        require(edit(app.root, 37) == composer && !IsWindowVisible(composer) &&
+                window_text(composer) == external_draft && saved_note(working_id)["messages"] == working_messages,
+                "Settings replaced the composer or sent its unsent draft");
+        back_from_settings(app.root);
+        require(edit(app.root, 37) == composer && IsWindowVisible(composer) &&
+                window_text(composer) == external_draft && focus_of(app.root) == composer,
+                "Back from Settings lost the composer, draft, or focus");
+        passed("edit context menus retain Select all and Settings preserves the unsent conversation");
         app.cli({L"notes", L"update", knock::widen(working_id), L"--tag", L"External"});
         std::this_thread::sleep_for(200ms);
         message(app.root, WM_NULL);
@@ -552,6 +716,16 @@ int main() {
         require(edit(app.root, 31) == empty_title_edit && IsWindowVisible(empty_title_edit) &&
                 window_text(empty_title_edit).empty() && focus_of(app.root) == empty_title_edit,
                 "Explicit Save silently accepted or restored an empty title");
+        open_settings(app.root, empty_title_edit);
+        require(!IsWindowVisible(empty_title_edit) && !IsWindowVisible(pending_body_edit) &&
+                edit(app.root, 31) == empty_title_edit && edit(app.root, 32) == pending_body_edit,
+                "Settings destroyed incomplete note metadata instead of keeping its editors");
+        back_from_settings(app.root);
+        require(edit(app.root, 31) == empty_title_edit && window_text(empty_title_edit).empty() &&
+                edit(app.root, 32) == pending_body_edit && window_text(pending_body_edit) == pending_description &&
+                edit(app.root, 37) == composer && window_text(composer) == external_draft &&
+                focus_of(app.root) == empty_title_edit,
+                "Back from Settings replaced the cleared title, pending description, composer, or focus");
         click(note_tab);
         require(edit(app.root, 31) == empty_title_edit && window_text(empty_title_edit).empty() &&
                 window_text(pending_body_edit) == pending_description,
@@ -669,6 +843,19 @@ int main() {
         set_text(edit(app.root, 32), L"Native GUI regression coverage");
         set_text(edit(app.root, 33), L"GUI-1");
         set_text(edit(app.root, 34), L"KNOCK");
+        const std::array<HWND, 4> task_editors{
+            edit(app.root, 31), edit(app.root, 32), edit(app.root, 33), edit(app.root, 34)};
+        open_settings(app.root, task_editors[2]);
+        for (HWND control : task_editors)
+            require(IsWindow(control) && !IsWindowVisible(control), "Settings did not preserve and hide a task editor");
+        back_from_settings(app.root);
+        for (std::size_t i = 0; i < task_editors.size(); ++i)
+            require(edit(app.root, 31 + static_cast<int>(i)) == task_editors[i] && IsWindowVisible(task_editors[i]),
+                    "Back from Settings recreated or lost a task editor");
+        require(window_text(task_editors[0]) == L"Interface regression task" &&
+                window_text(task_editors[1]) == L"Native GUI regression coverage" &&
+                window_text(task_editors[2]) == L"GUI-1" && window_text(task_editors[3]) == L"KNOCK",
+                "Settings lost edited task metadata");
         click(button(app.root, L"IN PROGRESS"));
         eventually([&] { return state()["tasks"].back()["status"] == "in_progress"; }, "task in progress");
         click(button(app.root, L"DONE"));
@@ -686,6 +873,11 @@ int main() {
         app.close();
         app.launch();
         require(state() == before_restart, "Normal quit and relaunch changed persisted data");
+        require(preferences() == expected_preferences, "Restart changed saved window or shortcut preferences");
+        open_settings(app.root, app.root);
+        require(window_text(edit(app.root, 41)) == L"420" && window_text(edit(app.root, 42)) == L"510",
+                "Restart did not load the saved dimensions into Settings");
+        back_from_settings(app.root);
         click(button(app.root, L"Notes"));
         eventually([&] { return buttons(app.root, L"Persistent note").size() == 1; }, "persisted note card");
         click(button(app.root, L"Persistent note"));
