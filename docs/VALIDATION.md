@@ -1,7 +1,7 @@
 # Validation
 
 The earlier sections retain the original platform and application checks.
-Version-specific additions follow; the latest results are in **Version 0.3**.
+Version-specific additions follow; the latest results are in **Version 0.4**.
 
 ## Windows platform and local IPC
 
@@ -184,6 +184,10 @@ On a Windows 11 desktop, confirm the following with the included CLI:
    while the popup is hidden or Task List / Notes is selected.
 5. Check the configurable shortcut, clipboard image paste, and tab transitions
    on the target Windows desktop, including after changing display scaling.
+6. Open Knock with the hotkey, then open Start and switch applications. Confirm
+   the popup stays visible, the same hotkey hides it, and an ordinary tray-opened
+   popup still hides when focus moves away. Check Settings from both the tray
+   menu and the popup's right-click menu.
 
 No real Windows 11 machine, notification center, or physical multi-monitor
 setup was available during this build. Those cases are explicitly unverified.
@@ -273,3 +277,62 @@ list, conversation, metadata editor, tag picker, and shortcut dialog. Test
 records are not included in the portable application. Real Windows 11 shell
 notification delivery/clicks, taskbar behavior, Explorer restart, multiple
 monitors, and high-DPI placement remain unverified desktop acceptance checks.
+
+## Version 0.4: Settings, persistent hotkey opening, and note commands
+
+The application and test executables cross-compiled without warnings using
+MinGW-w64. The native Linux CTest run passed both registered targets: the
+existing 23 core groups and five new window-preference groups.
+
+The window-preference tests also passed all six Windows groups under a private
+Wine prefix. They cover defaults, accepted and rejected dimensions, malformed
+and oversized input, preserving unrelated settings and recent shortcut changes,
+restart, and failure rollback. The Windows-only group holds the destination
+file open to force a real replacement failure; the original bytes and active
+dimensions survive and the temporary file is removed.
+
+The native GUI suite passed 20 groups under Wine. Added checks use the real
+owner-drawn popup menus and native edit/button controls, with messages directed
+only at the test application's UI thread. They do not send global input.
+The checks cover:
+
+- Settings from the root window, content background, a terminal tab, and note
+  and task editors; edit-menu Select all and popup Hide Knock remain available.
+- Empty and out-of-range dimensions leaving the window, saved settings, and
+  pending text intact; Apply, Back/reopen, RESET, and saved dimensions on restart.
+- Pending Settings input and focus surviving incoming state updates.
+- CHANGE opening shortcut capture, DISABLE/CANCEL leaving the previous binding
+  intact, and DISABLE/SAVE preserving the saved window dimensions.
+- Composer, note metadata, and task editor handles/text/focus surviving a
+  Settings round trip, including a cleared note title and unsent conversation.
+- A hotkey-opened popup retaining visibility and the topmost window style after
+  `WM_ACTIVATE/WA_INACTIVE`; a second hotkey hides it, while ordinary opening
+  still hides on deactivation.
+- The original title bug reproduced against version 0.3, then the corrected
+  behavior: empty titles remain empty across the debounce timer, incoming
+  updates, hide/reopen, and explicit-save validation until a replacement is
+  entered.
+
+A separate focused native GUI harness exercised the integrated note commands:
+slash suggestions and keyboard selection, unknown-command rejection, Unicode
+case-insensitive title matching, exact/prefix/substring ordering, selected-result
+opening, Back/query restoration, draft preservation, and stable controls during
+incoming snapshots. Deletion checks verify the chosen note ID is removed,
+Enter in the search field is harmless, and the second click of a double-click
+cannot delete a shifted row. Result pagination, keyboard navigation, and the
+thin scrollbar were exercised. A Settings round trip from a live search at
+360 × 360 retained its query and incorporated an incoming matching note.
+
+Rendered checks used the actual Windows executable on a private Wine/Openbox
+desktop. The dark context menu, Settings, command suggestions, search and
+deletion pages were inspected at the default size. The minimum-size Settings
+layout was also checked with the input-lease banner visible. Tab padding was
+tightened after the Notifications label was found truncated at minimum width.
+README screenshots of Settings and note search are captures of that running
+application with sample records.
+
+These results establish the tested Win32 behavior under Wine. Windows 11's
+actual Start menu, taskbar, notification delivery/clicks, Explorer restart,
+multi-monitor placement, and display scaling still require the desktop checks
+above. The retained version-0.3 CLI/image/shortcut results describe that release;
+they are not presented as new full-suite runs for version 0.4.
