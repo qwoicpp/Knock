@@ -1,0 +1,973 @@
+#include "knock/store.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cerrno>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <random>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <system_error>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+namespace knock {
+namespace {
+constexpr std::size_t max_state_bytes = 64 * 1024 * 1024;
+constexpr std::size_t max_records = 10000;
+constexpr std::size_t max_list_bytes = 800 * 1024;
+constexpr std::size_t max_note_tags = 12;
+constexpr std::size_t max_tag_bytes = 128;
+constexpr std::size_t max_tag_codepoints = 32;
+constexpr std::size_t max_note_messages = 2000;
+constexpr std::size_t max_message_bytes = 64 * 1024;
+constexpr std::size_t max_message_images = 8;
+
+Json empty_state() {
+    return {{"schema", 1}, {"requests", Json::array()}, {"jobs", Json::array()},
+            {"tasks", Json::array()}, {"notes", Json::array()}, {"lease", nullptr}};
+}
+
+bool has_text(const std::string& value) {
+    return std::any_of(value.begin(), value.end(), [](unsigned char c) {
+        return !std::isspace(c);
+    });
+}
+
+std::string text_field(const Json& object, const char* field, std::size_t limit,
+                       bool required = false, std::string fallback = {}) {
+    const auto it = object.find(field);
+    if (it == object.end()) {
+        if (required) throw std::runtime_error(std::string("missing_field: ") + field);
+        return fallback;
+    }
+    if (!it->is_string())
+        throw std::runtime_error(std::string("invalid_string: ") + field);
+    const auto value = it->get<std::string>();
+    if (value.size() > limit)
+        throw std::runtime_error(std::string("field_too_long: ") + field);
+    if (value.find('\0') != std::string::npos)
+        throw std::runtime_error(std::string("invalid_nul: ") + field);
+    if (required && !has_text(value))
+        throw std::runtime_error(std::string("empty_field: ") + field);
+    // A Json constructed by C++ callers can contain invalid UTF-8 even though
+    // the pipe JSON parser already rejects it.
+    (void)Json(value).dump();
+    return value;
+}
+
+Json note_tags(const Json& object) {
+    const auto it = object.find("tags");
+    if (it == object.end()) return Json::array();
+    if (!it->is_array()) throw std::runtime_error("invalid_array: tags");
+    if (it->size() > max_note_tags) throw std::runtime_error("too_many_tags: maximum 12");
+
+    Json result = Json::array();
+    std::set<std::string> seen;
+    for (const auto& input : *it) {
+        if (!input.is_string()) throw std::runtime_error("invalid_string: tag");
+        auto tag = input.get<std::string>();
+        const auto first = tag.find_first_not_of(' ');
+        if (first == std::string::npos) throw std::runtime_error("empty_field: tag");
+        tag = tag.substr(first, tag.find_last_not_of(' ') - first + 1);
+        if (tag.size() > max_tag_bytes) throw std::runtime_error("field_too_long: tag");
+        (void)Json(tag).dump(); // Validate UTF-8 before decoding scalar values below.
+
+        std::size_t characters = 0;
+        for (std::size_t offset = 0; offset < tag.size();) {
+            const auto first_byte = static_cast<unsigned char>(tag[offset++]);
+            const unsigned int trailing = first_byte < 0x80 ? 0 :
+                (first_byte < 0xE0 ? 1 : (first_byte < 0xF0 ? 2 : 3));
+            std::uint32_t codepoint = trailing ? first_byte & (0x3Fu >> trailing) : first_byte;
+            for (unsigned int index = 0; index < trailing; ++index)
+                codepoint = (codepoint << 6) | (static_cast<unsigned char>(tag[offset++]) & 0x3Fu);
+            if (codepoint < 0x20 || (codepoint >= 0x7F && codepoint <= 0x9F) ||
+                codepoint == 0x2028 || codepoint == 0x2029)
+                throw std::runtime_error("invalid_control: tag");
+            if (++characters > max_tag_codepoints) throw std::runtime_error("field_too_long: tag");
+        }
+
+        // Stable on every platform and locale. Preserve non-ASCII spelling;
+        // full Unicode case folding would need a separate Unicode dependency.
+        auto key = tag;
+        for (auto& character : key)
+            if (character >= 'A' && character <= 'Z') character += 'a' - 'A';
+        if (seen.insert(std::move(key)).second) result.push_back(std::move(tag));
+    }
+    return result;
+}
+
+Json note_images(const Json& object) {
+    const auto found = object.find("images");
+    if (found == object.end()) return Json::array();
+    if (!found->is_array()) throw std::runtime_error("invalid_array: images");
+    if (found->size() > max_message_images) throw std::runtime_error("too_many_images: maximum 8");
+    for (const auto& value : *found) {
+        if (!value.is_string()) throw std::runtime_error("invalid_string: image");
+        const auto name = value.get<std::string>();
+        if (name.size() < 5 || name.size() > 132 || !name.ends_with(".png"))
+            throw std::runtime_error("invalid_image_name");
+        const auto stem = std::string_view(name).substr(0, name.size() - 4);
+        if (!std::all_of(stem.begin(), stem.end(), [](unsigned char character) {
+                return (character >= 'a' && character <= 'z') ||
+                       (character >= 'A' && character <= 'Z') ||
+                       (character >= '0' && character <= '9') || character == '-' || character == '_';
+            }))
+            throw std::runtime_error("invalid_image_name");
+    }
+    return *found;
+}
+
+void require_message_content(const std::string& text, const Json& images) {
+    if (!has_text(text) && images.empty()) throw std::runtime_error("empty_message");
+}
+
+std::string message_client_id(const Json& object, bool required = false) {
+    const auto found = object.find("client_id");
+    if (found == object.end()) {
+        if (required) throw std::runtime_error("missing_field: client_id");
+        return {};
+    }
+    if (!found->is_string()) throw std::runtime_error("invalid_client_id");
+    const auto value = found->get<std::string>();
+    if (value.size() != 32 || !std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        })) throw std::runtime_error("invalid_client_id");
+    return value;
+}
+
+Json note_view(const Json& note, bool preview_body = false) {
+    Json view = Json::object();
+    for (const auto* field : {"id", "title", "body", "tags", "created_at", "updated_at"})
+        if (note.contains(field)) view[field] = note[field];
+    view["message_count"] = note.contains("messages") ? note["messages"].size() : 0;
+    if (preview_body) {
+        const auto& body = note.at("body").get_ref<const std::string&>();
+        if (body.size() > 512) {
+            std::size_t length = 512;
+            while (length && (static_cast<unsigned char>(body[length]) & 0xC0) == 0x80) --length;
+            view["body"] = body.substr(0, length);
+            view["body_truncated"] = true;
+        }
+    }
+    return view;
+}
+
+std::int64_t integer_field(const Json& object, const char* field, std::int64_t low,
+                           std::int64_t high, std::int64_t fallback,
+                           bool required = false) {
+    const auto it = object.find(field);
+    if (it == object.end()) {
+        if (required) throw std::runtime_error(std::string("missing_field: ") + field);
+        return fallback;
+    }
+    if (!it->is_number_integer())
+        throw std::runtime_error(std::string("invalid_integer: ") + field);
+    if (it->is_number_unsigned() && it->get<std::uint64_t>() >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::runtime_error(std::string("integer_out_of_range: ") + field);
+    const auto value = it->get<std::int64_t>();
+    if (value < low || value > high)
+        throw std::runtime_error(std::string("integer_out_of_range: ") + field);
+    return value;
+}
+
+std::string id_field(const Json& object) {
+    const auto id = text_field(object, "id", 128, true);
+    if (!std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+        }))
+        throw std::runtime_error("invalid_id");
+    return id;
+}
+
+bool is_one_of(const std::string& value, std::initializer_list<const char*> options) {
+    return std::any_of(options.begin(), options.end(), [&](const char* option) {
+        return value == option;
+    });
+}
+
+void require_fields(const Json& record, std::initializer_list<const char*> fields) {
+    for (const auto* field : fields) {
+        if (!record.contains(field)) throw std::runtime_error(std::string("missing_field: ") + field);
+    }
+}
+
+Json& find_record(Json& records, const std::string& id) {
+    for (auto& record : records) {
+        if (record.at("id") == id) return record;
+    }
+    throw std::runtime_error("not_found: " + id);
+}
+
+Json record_summary(const Json& record) {
+    Json result = Json::object();
+    for (const auto* field : {"id", "chat", "title", "kind", "status", "operator", "project", "tags",
+                             "created_at", "updated_at", "finished_at", "resolved_at", "expires_at",
+                             "lease_seconds", "lease_until", "released_at", "release_reason",
+                             "exit_code", "worker_pid", "archived"}) {
+        if (record.contains(field)) result[field] = record[field];
+    }
+    if (record.contains("messages")) result["message_count"] = record["messages"].size();
+    return result;
+}
+
+Json list_records(const Json& state, const Json& command) {
+    const auto collection = text_field(command, "collection", 16, true);
+    if (!is_one_of(collection, {"requests", "jobs", "tasks", "notes"}))
+        throw std::runtime_error("invalid_collection");
+    const auto offset = static_cast<std::uint64_t>(integer_field(command, "offset", 0, INT64_MAX, 0));
+    const auto limit = static_cast<std::size_t>(integer_field(command, "limit", 1, 100, 50));
+    if (command.contains("summaries") && !command["summaries"].is_boolean())
+        throw std::runtime_error("invalid_boolean: summaries");
+    const bool summaries = command.value("summaries", false);
+    const auto& records = state[collection];
+    const auto total = records.size();
+    Json result{{"ok", true}, {"items", Json::array()}, {"total", total}, {"next_offset", nullptr}};
+    if (offset >= total) return result;
+
+    // Count encoded JSON bytes, including escaping, rather than source string
+    // lengths. Reserve enough digits for next_offset before filling the page.
+    std::size_t encoded_bytes = result.dump().size() + std::to_string(total).size();
+    auto& items = result["items"];
+    const auto start = static_cast<std::size_t>(offset);
+    for (std::size_t index = start; index < total && items.size() < limit; ++index) {
+        const auto& record = records[total - 1 - index];
+        Json item = summaries ? record_summary(record) :
+            (collection == "notes" ? note_view(record) : record);
+        const auto item_bytes = item.dump().size() + (items.empty() ? 0 : 1);
+        if (encoded_bytes + item_bytes > max_list_bytes) {
+            if (items.empty()) throw std::runtime_error("list_item_exceeds_page_budget: use summaries=true");
+            break;
+        }
+        encoded_bytes += item_bytes;
+        items.push_back(std::move(item));
+    }
+    const auto next = start + items.size();
+    if (next < total) result["next_offset"] = next;
+    return result;
+}
+
+Json read_note(const Json& note, const Json& command) {
+    const auto offset = static_cast<std::uint64_t>(integer_field(command, "offset", 0, INT64_MAX, 0));
+    const auto limit = static_cast<std::size_t>(integer_field(command, "limit", 1, 100, 100));
+    const auto& messages = note.at("messages");
+    const auto total = messages.size();
+    Json view = note_view(note);
+    view["messages"] = Json::array();
+    Json result{{"ok", true}, {"note", std::move(view)}, {"offset", offset},
+                {"total_messages", total}, {"next_offset", nullptr}};
+    if (offset >= total) return result;
+    auto& page = result["note"]["messages"];
+    std::size_t encoded_bytes = result.dump().size() + std::to_string(total).size();
+    const auto start = static_cast<std::size_t>(offset);
+    for (std::size_t index = start; index < total && page.size() < limit; ++index) {
+        const auto message_bytes = messages[index].dump().size() + (page.empty() ? 0 : 1);
+        if (encoded_bytes + message_bytes > max_list_bytes) {
+            if (page.empty()) throw std::runtime_error("note_message_exceeds_page_budget");
+            break;
+        }
+        encoded_bytes += message_bytes;
+        page.push_back(messages[index]);
+    }
+    const auto next = start + page.size();
+    if (next < total) result["next_offset"] = next;
+    return result;
+}
+
+void room_for_record(const Json& records) {
+    if (records.size() >= max_records) throw std::runtime_error("history_limit_reached");
+}
+
+Json event(std::string type, const Json* record = nullptr, std::string message = {}) {
+    Json result = {{"type", std::move(type)}, {"id", ""}, {"chat", ""},
+                   {"title", ""}, {"message", std::move(message)}};
+    if (record) {
+        result["id"] = record->value("id", "");
+        result["chat"] = record->value("chat", "");
+        result["title"] = record->value("title", record->value("chat", ""));
+        if (result["message"] == "") result["message"] = record->value("message", "");
+    }
+    return result;
+}
+
+void deliver(const ChangeCallback& callback, const std::vector<Json>& events) noexcept {
+    if (!callback) return;
+    for (const auto& notification : events) {
+        // Persistence has committed. A UI callback failure must not turn a
+        // successful operation into an apparent failure that gets retried.
+        try { callback(notification); } catch (...) {}
+    }
+}
+
+bool expire_records(Json& state, std::int64_t now) {
+    bool changed = false;
+    for (auto& request : state["requests"]) {
+        if (request["status"] == "pending" && request["expires_at"].get<std::int64_t>() <= now) {
+            request["status"] = "expired";
+            request["resolved_at"] = now;
+            request["response"] = "";
+            changed = true;
+        }
+    }
+    if (!state["lease"].is_null() && state["lease"]["until"].get<std::int64_t>() <= now) {
+        auto& request = find_record(state["requests"], state["lease"]["id"].get<std::string>());
+        request["status"] = "released";
+        request["released_at"] = now;
+        request["release_reason"] = "expired";
+        state["lease"] = nullptr;
+        changed = true;
+    }
+    return changed;
+}
+
+void validate_state(const Json& state) {
+    if (!state.is_object() || integer_field(state, "schema", 1, 1, 0, true) != 1)
+        throw std::runtime_error("unsupported_state_schema");
+    if (!state.contains("lease")) throw std::runtime_error("missing_lease");
+    std::set<std::string> ids;
+    for (const auto* collection : {"requests", "jobs", "tasks", "notes"}) {
+        if (!state.contains(collection) || !state[collection].is_array() ||
+            state[collection].size() > max_records)
+            throw std::runtime_error(std::string("invalid_collection: ") + collection);
+        for (const auto& record : state[collection]) {
+            if (!record.is_object()) throw std::runtime_error("invalid_record");
+            if (!ids.insert(id_field(record)).second) throw std::runtime_error("duplicate_id");
+            integer_field(record, "created_at", 0, INT64_MAX, 0, true);
+            if (record.contains("archived") && !record["archived"].is_boolean())
+                throw std::runtime_error("invalid_archived");
+            const std::string category(collection);
+            if (category == "requests") {
+                require_fields(record, {"chat", "message", "kind", "status", "response", "lease_seconds", "lease_until", "expires_at"});
+                text_field(record, "chat", 64, true);
+                text_field(record, "message", 16000, true);
+                if (!is_one_of(text_field(record, "kind", 16, true), {"input", "question"}))
+                    throw std::runtime_error("invalid_request_kind");
+                if (!is_one_of(text_field(record, "status", 16, true),
+                    {"pending", "approved", "denied", "custom", "expired", "cancelled", "released"}))
+                    throw std::runtime_error("invalid_request_status");
+                text_field(record, "response", 16000, false);
+                integer_field(record, "lease_seconds", 1, 3600, 0, true);
+                integer_field(record, "lease_until", 0, INT64_MAX, 0, true);
+                integer_field(record, "expires_at", record["created_at"].get<std::int64_t>(), INT64_MAX, 0, true);
+                if (record["status"] == "custom") text_field(record, "response", 16000, true);
+                if (record["status"] != "pending") integer_field(record, "resolved_at", 0, INT64_MAX, 0, true);
+                if (record["status"] == "pending" &&
+                    (record["response"] != "" || record["lease_until"] != 0 || record.value("archived", false)))
+                    throw std::runtime_error("inconsistent_pending_request");
+                if (record["kind"] == "question" && (record["lease_until"] != 0 || record["status"] == "released"))
+                    throw std::runtime_error("inconsistent_question_lease");
+            } else if (category == "jobs") {
+                require_fields(record, {"chat", "title", "command", "cwd", "log_path", "status", "exit_code", "output_tail", "resume_text"});
+                text_field(record, "chat", 64, true);
+                const auto status = text_field(record, "status", 16, true);
+                if (!is_one_of(status, {"running", "completed", "failed", "notice"}))
+                    throw std::runtime_error("invalid_job_status");
+                text_field(record, "title", status == "notice" ? 16000 : 160, true);
+                text_field(record, "command", 64000);
+                text_field(record, "cwd", 32768);
+                text_field(record, "log_path", 32768);
+                text_field(record, "output_tail", 16000);
+                text_field(record, "resume_text", 16000);
+                text_field(record, "error", 16000);
+                integer_field(record, "worker_pid", 0, UINT32_MAX, 0);
+                if (status == "running") {
+                    if (!record.contains("exit_code") || !record["exit_code"].is_null())
+                        throw std::runtime_error("invalid_running_exit_code");
+                } else {
+                    integer_field(record, "exit_code", INT32_MIN, UINT32_MAX, 0, true);
+                    integer_field(record, "finished_at", 0, INT64_MAX, 0, true);
+                    if ((status == "completed" || status == "notice") && record["exit_code"] != 0)
+                        throw std::runtime_error("inconsistent_success_exit_code");
+                    if (status == "failed" && record["exit_code"] == 0)
+                        throw std::runtime_error("inconsistent_failed_exit_code");
+                }
+            } else {
+                require_fields(record, {"title", "body", "updated_at"});
+                text_field(record, "title", 160, true);
+                text_field(record, "body", 64000);
+                integer_field(record, "updated_at", 0, INT64_MAX, 0, true);
+                if (category == "tasks") {
+                    require_fields(record, {"operator", "project", "status"});
+                    text_field(record, "operator", 64);
+                    text_field(record, "project", 160);
+                    if (!is_one_of(text_field(record, "status", 16, true), {"todo", "in_progress", "done"}))
+                        throw std::runtime_error("invalid_task_status");
+                } else {
+                    (void)note_tags(record);
+                    if (record.contains("messages")) {
+                        const auto& messages = record["messages"];
+                        if (!messages.is_array() || messages.size() > max_note_messages)
+                            throw std::runtime_error("invalid_note_messages");
+                        std::set<std::string> message_ids;
+                        std::set<std::string> client_ids;
+                        for (const auto& message : messages) {
+                            if (!message.is_object()) throw std::runtime_error("invalid_note_message");
+                            require_fields(message, {"id", "text", "images", "created_at"});
+                            if (!message_ids.insert(id_field(message)).second)
+                                throw std::runtime_error("duplicate_message_id");
+                            integer_field(message, "created_at", 0, INT64_MAX, 0, true);
+                            const auto text = text_field(message, "text", max_message_bytes);
+                            require_message_content(text, note_images(message));
+                            const auto client_id = message_client_id(message);
+                            if (!client_id.empty() && !client_ids.insert(client_id).second)
+                                throw std::runtime_error("duplicate_message_client_id");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!state["lease"].is_null()) {
+        const auto& lease = state["lease"];
+        if (!lease.is_object()) throw std::runtime_error("invalid_lease");
+        const auto id = id_field(lease);
+        const auto chat = text_field(lease, "chat", 64, true);
+        const auto until = integer_field(lease, "until", 1, INT64_MAX, 0, true);
+        bool found = false;
+        for (const auto& request : state["requests"]) {
+            if (request["id"] == id) {
+                found = request["kind"] == "input" && request["status"] == "approved" &&
+                        request["chat"] == chat && request["lease_until"] == until;
+                break;
+            }
+        }
+        if (!found) throw std::runtime_error("inconsistent_lease");
+    }
+}
+
+void atomic_write(const std::filesystem::path& destination, const std::string& bytes) {
+    const auto temporary = destination.parent_path() / (".state-" + make_id() + ".tmp");
+#ifdef _WIN32
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        throw std::system_error(GetLastError(), std::system_category(), "create state temporary file");
+    try {
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            DWORD written = 0;
+            if (!WriteFile(file, bytes.data() + offset, static_cast<DWORD>(bytes.size() - offset), &written, nullptr) || !written)
+                throw std::system_error(GetLastError(), std::system_category(), "write state");
+            offset += written;
+        }
+        if (!FlushFileBuffers(file))
+            throw std::system_error(GetLastError(), std::system_category(), "flush state");
+        if (!CloseHandle(file)) {
+            file = INVALID_HANDLE_VALUE;
+            throw std::system_error(GetLastError(), std::system_category(), "close state");
+        }
+        file = INVALID_HANDLE_VALUE;
+        if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::system_error(GetLastError(), std::system_category(), "replace state");
+    } catch (...) {
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+        DeleteFileW(temporary.c_str());
+        throw;
+    }
+#else
+    int file = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (file < 0) throw std::system_error(errno, std::generic_category(), "create state temporary file");
+    try {
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const auto written = ::write(file, bytes.data() + offset, bytes.size() - offset);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) throw std::system_error(errno, std::generic_category(), "write state");
+            offset += static_cast<std::size_t>(written);
+        }
+        if (::fsync(file) != 0) throw std::system_error(errno, std::generic_category(), "flush state");
+        if (::close(file) != 0) {
+            file = -1;
+            throw std::system_error(errno, std::generic_category(), "close state");
+        }
+        file = -1;
+        if (::rename(temporary.c_str(), destination.c_str()) != 0)
+            throw std::system_error(errno, std::generic_category(), "replace state");
+        // The rename is the commit point. Do not report rollback after it.
+        const int directory = ::open(destination.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+        if (directory >= 0) { (void)::fsync(directory); ::close(directory); }
+    } catch (...) {
+        if (file >= 0) ::close(file);
+        ::unlink(temporary.c_str());
+        throw;
+    }
+#endif
+}
+} // namespace
+
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+std::string make_id() {
+    static std::atomic<std::uint64_t> sequence{0};
+    std::random_device source;
+    const auto random = (static_cast<std::uint64_t>(source()) << 32) ^ source();
+    std::ostringstream stream;
+    stream << std::hex << now_ms() << '-' << random << '-' << sequence.fetch_add(1);
+    return stream.str();
+}
+
+Store::Store(std::filesystem::path directory) : directory_(std::move(directory)), state_(empty_state()) {}
+Store::~Store() { stop(); }
+
+void Store::load() {
+    std::lock_guard lock(mutex_);
+    loaded_ = false;
+    std::filesystem::create_directories(directory_);
+    const auto path = directory_ / "state.json";
+    Json loaded = empty_state();
+    const bool exists = std::filesystem::exists(path);
+    if (exists) {
+        const auto size = std::filesystem::file_size(path);
+        if (!size || size > max_state_bytes) throw std::runtime_error("state file is empty or too large; original preserved");
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot read state file; original preserved");
+        std::string contents(static_cast<std::size_t>(size), '\0');
+        input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+        if (!input || input.gcount() != static_cast<std::streamsize>(contents.size()))
+            throw std::runtime_error("cannot read complete state file; original preserved");
+        try {
+            loaded = Json::parse(contents);
+            validate_state(loaded);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("invalid state file; original preserved: ") + error.what());
+        }
+    }
+    bool dirty = !exists;
+    // Tags are additive in schema 1. Preserve old notes and their timestamps
+    // while making the field available consistently to UI and CLI readers.
+    for (auto& note : loaded["notes"]) {
+        auto tags = note_tags(note);
+        if (!note.contains("tags") || note["tags"] != tags) {
+            note["tags"] = std::move(tags);
+            dirty = true;
+        }
+        if (!note.contains("messages")) {
+            note["messages"] = Json::array();
+            const auto body = note["body"].get<std::string>();
+            if (has_text(body)) {
+                note["messages"].push_back({{"id", make_id()}, {"text", body},
+                    {"images", Json::array()}, {"created_at", note["updated_at"]}});
+            }
+            dirty = true;
+        }
+    }
+    const auto now = now_ms();
+    // An old Yes must not regain control after the tray process has restarted.
+    for (auto& request : loaded["requests"]) {
+        if (request["kind"] == "input" && request["status"] == "approved") {
+            request["status"] = "released";
+            request["released_at"] = now;
+            request["release_reason"] = "restart";
+            dirty = true;
+        }
+    }
+    if (!loaded["lease"].is_null()) { loaded["lease"] = nullptr; dirty = true; }
+    dirty = expire_records(loaded, now) || dirty;
+    auto previous = std::move(state_);
+    state_ = std::move(loaded);
+    try {
+        if (dirty) save_locked();
+        stopped_ = false;
+        loaded_ = true;
+    } catch (...) {
+        state_ = std::move(previous);
+        throw;
+    }
+}
+
+void Store::save_locked() {
+    const auto contents = state_.dump(2) + '\n';
+    if (contents.size() > max_state_bytes) throw std::runtime_error("state_size_limit_reached");
+    atomic_write(directory_ / "state.json", contents);
+}
+
+bool Store::expire_locked() {
+    const auto now = now_ms();
+    bool due = !state_["lease"].is_null() && state_["lease"]["until"].get<std::int64_t>() <= now;
+    if (!due) {
+        for (const auto& request : state_["requests"]) {
+            if (request["status"] == "pending" && request["expires_at"].get<std::int64_t>() <= now) {
+                due = true;
+                break;
+            }
+        }
+    }
+    if (!due) return false;
+    auto previous = state_;
+    expire_records(state_, now);
+    try { save_locked(); }
+    catch (...) { state_ = std::move(previous); throw; }
+    return true;
+}
+
+void Store::set_changed(ChangeCallback callback) {
+    std::lock_guard lock(mutex_);
+    callback_ = std::move(callback);
+}
+
+void Store::stop() {
+    {
+        std::lock_guard lock(mutex_);
+        stopped_ = true;
+    }
+    changed_.notify_all();
+}
+
+void Store::tick() {
+    ChangeCallback callback;
+    bool expired = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (!loaded_ || stopped_) return;
+        expired = expire_locked();
+        callback = callback_;
+    }
+    if (expired) {
+        changed_.notify_all();
+        deliver(callback, {event("updated")});
+    }
+}
+
+Json Store::snapshot() {
+    auto result = handle({{"op", "snapshot"}});
+    if (!result.value("ok", false)) throw std::runtime_error(result.value("error", "snapshot failed"));
+    return std::move(result["state"]);
+}
+
+Json Store::handle(const Json& command, bool trusted_ui) {
+    std::unique_lock lock(mutex_);
+    Json result;
+    std::vector<Json> events;
+    ChangeCallback callback;
+    try {
+        if (!loaded_) throw std::runtime_error("store_not_loaded");
+        if (stopped_) throw std::runtime_error("store_stopped");
+        if (!command.is_object()) throw std::runtime_error("command_must_be_object");
+        const auto op = text_field(command, "op", 64, true);
+        if (op == "request.wait") {
+            const auto id = id_field(command);
+            const auto seconds = integer_field(command, "wait_seconds", 1, 86400, 86400);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+            for (;;) {
+                if (stopped_) throw std::runtime_error("store_stopped");
+                if (expire_locked()) {
+                    const auto changed_callback = callback_;
+                    lock.unlock();
+                    changed_.notify_all();
+                    deliver(changed_callback, {event("updated")});
+                    lock.lock();
+                    continue;
+                }
+                const auto& request = find_record(state_["requests"], id);
+                if (request["status"] != "pending" || std::chrono::steady_clock::now() >= deadline) {
+                    result = {{"ok", true}, {"request", request}};
+                    break;
+                }
+                const auto remaining = std::max<std::int64_t>(1, request["expires_at"].get<std::int64_t>() - now_ms());
+                const auto wake = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining));
+                changed_.wait_until(lock, wake);
+            }
+        } else {
+            if (expire_locked()) events.push_back(event("updated"));
+            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message"});
+            Json previous = may_mutate ? state_ : Json();
+            bool dirty = false;
+            Json notification;
+            try {
+                const auto now = now_ms();
+                if (op == "snapshot") {
+                    Json snapshot = Json::object();
+                    for (const auto* field : {"schema", "requests", "jobs", "tasks", "lease"})
+                        snapshot[field] = state_[field];
+                    snapshot["notes"] = Json::array();
+                    for (const auto& note : state_["notes"])
+                        snapshot["notes"].push_back(note_view(note, true));
+                    result = {{"ok", true}, {"state", std::move(snapshot)}};
+                } else if (op == "status") {
+                    const auto count_status = [&](const char* collection, const char* status) {
+                        const auto& records = state_[collection];
+                        return std::count_if(records.begin(), records.end(), [&](const Json& record) {
+                            return record["status"] == status;
+                        });
+                    };
+                    result = {{"ok", true}, {"requests_pending", count_status("requests", "pending")},
+                              {"jobs_running", count_status("jobs", "running")},
+                              {"tasks_todo", count_status("tasks", "todo")},
+                              {"notes", state_["notes"].size()}, {"lease", state_["lease"]}};
+                } else if (op == "list") {
+                    result = list_records(state_, command);
+                } else if (op == "job.result") {
+                    result = {{"ok", true}, {"job", find_record(state_["jobs"], id_field(command))}};
+                } else if (op == "note.get") {
+                    result = read_note(find_record(state_["notes"], id_field(command)), command);
+                } else if (op == "note.find_message") {
+                    const auto client_id = message_client_id(command, true);
+                    const auto note_id = id_field(command);
+                    const auto& note = find_record(state_["notes"], note_id);
+                    const auto& messages = note["messages"];
+                    const auto found = std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
+                        return message.value("client_id", "") == client_id;
+                    });
+                    result = {{"ok", true}, {"message", found == messages.end() ? Json() : *found}};
+                } else if (op == "note.append") {
+                    auto& note = find_record(state_["notes"], id_field(command));
+                    auto& messages = note["messages"];
+                    const auto text = text_field(command, "text", max_message_bytes);
+                    auto images = note_images(command);
+                    require_message_content(text, images);
+                    const auto client_id = message_client_id(command);
+                    const auto found = client_id.empty() ? messages.end() :
+                        std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
+                            return message.value("client_id", "") == client_id;
+                        });
+                    if (found != messages.end()) {
+                        if ((*found)["text"] != text || (*found)["images"] != images)
+                            throw std::runtime_error("message_client_id_conflict");
+                        result = {{"ok", true}, {"note_id", note["id"]}, {"message", *found},
+                                  {"message_count", messages.size()}};
+                    } else {
+                        if (messages.size() >= max_note_messages)
+                            throw std::runtime_error("note_message_limit_reached");
+                        Json message{{"id", make_id()}, {"text", text}, {"images", std::move(images)}, {"created_at", now}};
+                        if (!client_id.empty()) message["client_id"] = client_id;
+                        messages.push_back(message);
+                        note["updated_at"] = now;
+                        result = {{"ok", true}, {"note_id", note["id"]}, {"message", std::move(message)},
+                                  {"message_count", messages.size()}};
+                        notification = event("updated", &note);
+                        notification["operation"] = op;
+                        dirty = true;
+                    }
+                } else if (op == "note.message.remove") {
+                    auto& note = find_record(state_["notes"], id_field(command));
+                    const auto message_id = text_field(command, "message_id", 128, true);
+                    auto& messages = note["messages"];
+                    const auto found = std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
+                        return message["id"] == message_id;
+                    });
+                    if (found == messages.end()) throw std::runtime_error("message_not_found");
+                    messages.erase(found);
+                    note["updated_at"] = now;
+                    result = {{"ok", true}, {"note_id", note["id"]}, {"message_count", messages.size()}};
+                    notification = event("updated", &note);
+                    notification["operation"] = op;
+                    dirty = true;
+                } else if (op == "request.create") {
+                    room_for_record(state_["requests"]);
+                    const auto kind = text_field(command, "kind", 16, false, "input");
+                    if (!is_one_of(kind, {"input", "question"})) throw std::runtime_error("invalid_request_kind");
+                    Json request = {{"id", make_id()}, {"chat", text_field(command, "chat", 64, true)},
+                        {"message", text_field(command, "message", 16000, true)}, {"kind", kind},
+                        {"created_at", now}, {"expires_at", now + 1000 * integer_field(command, "timeout_seconds", 1, 86400, 1800)},
+                        {"status", "pending"}, {"response", ""},
+                        {"lease_seconds", integer_field(command, "lease_seconds", 1, 3600, 300)}, {"lease_until", 0}};
+                    state_["requests"].push_back(request);
+                    result = {{"ok", true}, {"request", request}};
+                    notification = event("request", &request);
+                    dirty = true;
+                } else if (op == "request.result") {
+                    result = {{"ok", true}, {"request", find_record(state_["requests"], id_field(command))}};
+                } else if (op == "request.resolve") {
+                    if (!trusted_ui) throw std::runtime_error("forbidden: GUI approval required");
+                    auto& request = find_record(state_["requests"], id_field(command));
+                    if (request["status"] != "pending") throw std::runtime_error("already_resolved");
+                    const auto decision = text_field(command, "decision", 16, true);
+                    if (!is_one_of(decision, {"approved", "denied", "custom"})) throw std::runtime_error("invalid_decision");
+                    const auto response = decision == "custom" ? text_field(command, "text", 16000, true)
+                        : (decision == "approved" ? std::string("Yes") : std::string("No"));
+                    if (decision == "approved" && request["kind"] == "input") {
+                        if (!state_["lease"].is_null()) throw std::runtime_error("input_busy");
+                        const auto until = now + request["lease_seconds"].get<std::int64_t>() * 1000;
+                        request["lease_until"] = until;
+                        state_["lease"] = {{"id", request["id"]}, {"chat", request["chat"]}, {"until", until}};
+                    }
+                    request["status"] = decision;
+                    request["response"] = response;
+                    request["resolved_at"] = now;
+                    result = {{"ok", true}, {"request", request}};
+                    notification = event("updated", &request);
+                    dirty = true;
+                } else if (op == "request.cancel") {
+                    auto& request = find_record(state_["requests"], id_field(command));
+                    if (request["status"] != "pending") throw std::runtime_error("already_resolved");
+                    request["status"] = "cancelled";
+                    request["response"] = "";
+                    request["resolved_at"] = now;
+                    result = {{"ok", true}, {"request", request}};
+                    notification = event("updated", &request);
+                    dirty = true;
+                } else if (op == "request.release") {
+                    auto& request = find_record(state_["requests"], id_field(command));
+                    if (request["kind"] != "input" || !is_one_of(request["status"].get<std::string>(), {"approved", "released"}))
+                        throw std::runtime_error("no_active_lease");
+                    if (request["status"] == "approved") {
+                        if (state_["lease"].is_null() || state_["lease"]["id"] != request["id"])
+                            throw std::runtime_error("no_active_lease");
+                        state_["lease"] = nullptr;
+                        request["status"] = "released";
+                        request["released_at"] = now;
+                        request["release_reason"] = "released";
+                        dirty = true;
+                    }
+                    result = {{"ok", true}, {"request", request}};
+                    notification = event("updated", &request);
+                } else if (op == "job.create") {
+                    room_for_record(state_["jobs"]);
+                    Json job = {{"id", make_id()}, {"chat", text_field(command, "chat", 64, true)},
+                        {"title", text_field(command, "title", 160, true)}, {"command", text_field(command, "command", 64000)},
+                        {"cwd", text_field(command, "cwd", 32768)}, {"log_path", text_field(command, "log_path", 32768)},
+                        {"worker_pid", integer_field(command, "worker_pid", 0, UINT32_MAX, 0)},
+                        {"created_at", now}, {"status", "running"}, {"exit_code", nullptr},
+                        {"output_tail", ""}, {"resume_text", ""}};
+                    state_["jobs"].push_back(job);
+                    result = {{"ok", true}, {"job", job}};
+                    notification = event("updated", &job);
+                    dirty = true;
+                } else if (op == "job.started") {
+                    auto& job = find_record(state_["jobs"], id_field(command));
+                    if (job["status"] != "running") throw std::runtime_error("already_finished");
+                    const auto pid = integer_field(command, "worker_pid", 1, UINT32_MAX, 0, true);
+                    const auto previous_pid = job.value("worker_pid", std::int64_t{0});
+                    if (previous_pid && previous_pid != pid) throw std::runtime_error("worker_already_started");
+                    job["worker_pid"] = pid;
+                    result = {{"ok", true}, {"job", job}};
+                    notification = event("updated", &job);
+                    dirty = previous_pid != pid;
+                } else if (op == "job.finish") {
+                    auto& job = find_record(state_["jobs"], id_field(command));
+                    const auto exit_code = integer_field(command, "exit_code", INT32_MIN, UINT32_MAX, 0, true);
+                    const auto output = text_field(command, "output_tail", 16000);
+                    const auto resume = text_field(command, "resume_text", 16000);
+                    const auto error = text_field(command, "error", 16000);
+                    if (job["status"] != "running") {
+                        if (!is_one_of(job["status"].get<std::string>(), {"completed", "failed"}) ||
+                            job["exit_code"] != exit_code || job["output_tail"] != output ||
+                            job["resume_text"] != resume || job.value("error", "") != error)
+                            throw std::runtime_error("already_finished");
+                    } else {
+                        job["exit_code"] = exit_code;
+                        job["status"] = exit_code == 0 ? "completed" : "failed";
+                        job["finished_at"] = now;
+                        job["output_tail"] = output;
+                        job["resume_text"] = resume;
+                        if (command.contains("error")) job["error"] = error;
+                        dirty = true;
+                    }
+                    result = {{"ok", true}, {"job", job}};
+                    notification = event("job", &job, job["title"].get<std::string>() +
+                        (exit_code == 0 ? " finished." : " failed (exit " + std::to_string(exit_code) + ")."));
+                } else if (op == "notify") {
+                    room_for_record(state_["jobs"]);
+                    Json job = {{"id", make_id()}, {"chat", text_field(command, "chat", 64, true)},
+                        {"title", text_field(command, "message", 16000, true)}, {"command", ""}, {"cwd", ""},
+                        {"log_path", ""}, {"worker_pid", 0}, {"created_at", now}, {"finished_at", now},
+                        {"status", "notice"}, {"exit_code", 0}, {"output_tail", ""},
+                        {"resume_text", text_field(command, "resume_text", 16000)}};
+                    state_["jobs"].push_back(job);
+                    result = {{"ok", true}, {"job", job}};
+                    notification = event("job", &job, job["title"].get<std::string>());
+                    dirty = true;
+                } else if (op == "task.add" || op == "note.add") {
+                    const bool task = op == "task.add";
+                    auto& records = state_[task ? "tasks" : "notes"];
+                    room_for_record(records);
+                    Json record = {{"id", make_id()}, {"title", text_field(command, "title", 160, true)},
+                        {"body", text_field(command, "body", 64000)}, {"created_at", now}, {"updated_at", now}};
+                    if (task) {
+                        record["operator"] = text_field(command, "operator", 64, false, "ME");
+                        record["project"] = text_field(command, "project", 160);
+                        record["status"] = "todo";
+                    } else {
+                        record["tags"] = note_tags(command);
+                        record["messages"] = Json::array();
+                    }
+                    records.push_back(record);
+                    result = {{"ok", true}, {task ? "task" : "note", task ? record : note_view(record)}};
+                    notification = event("updated", &record);
+                    if (!task) notification["operation"] = op;
+                    dirty = true;
+                } else if (op == "task.update" || op == "note.update") {
+                    const bool task = op == "task.update";
+                    auto& record = find_record(state_[task ? "tasks" : "notes"], id_field(command));
+                    if (command.contains("title")) record["title"] = text_field(command, "title", 160, true);
+                    if (command.contains("body")) record["body"] = text_field(command, "body", 64000);
+                    if (task) {
+                        if (command.contains("operator")) record["operator"] = text_field(command, "operator", 64);
+                        if (command.contains("project")) record["project"] = text_field(command, "project", 160);
+                        if (command.contains("status")) {
+                            const auto status = text_field(command, "status", 16, true);
+                            if (!is_one_of(status, {"todo", "in_progress", "done"})) throw std::runtime_error("invalid_task_status");
+                            record["status"] = status;
+                        }
+                    } else if (command.contains("tags")) {
+                        record["tags"] = note_tags(command);
+                    }
+                    record["updated_at"] = now;
+                    result = {{"ok", true}, {task ? "task" : "note", task ? record : note_view(record)}};
+                    notification = event("updated", &record);
+                    if (!task) notification["operation"] = op;
+                    dirty = true;
+                } else if (op == "task.delete" || op == "note.delete") {
+                    auto& records = state_[op == "task.delete" ? "tasks" : "notes"];
+                    const auto id = id_field(command);
+                    const auto& record = find_record(records, id);
+                    notification = event("updated", &record);
+                    if (op == "note.delete") notification["operation"] = op;
+                    records.erase(std::find_if(records.begin(), records.end(), [&](const Json& item) { return item["id"] == id; }));
+                    result = {{"ok", true}};
+                    dirty = true;
+                } else if (op == "item.dismiss") {
+                    const auto kind = text_field(command, "kind", 16, true);
+                    if (!is_one_of(kind, {"request", "job"})) throw std::runtime_error("invalid_item_kind");
+                    auto& record = find_record(state_[kind == "request" ? "requests" : "jobs"], id_field(command));
+                    if (record["status"] == "pending" || record["status"] == "running")
+                        throw std::runtime_error("item_still_active");
+                    record["archived"] = true;
+                    result = {{"ok", true}};
+                    notification = event("updated", &record);
+                    dirty = true;
+                } else {
+                    throw std::runtime_error("unknown_operation: " + op);
+                }
+                if (dirty) {
+                    save_locked();
+                    events.push_back(std::move(notification));
+                }
+            } catch (...) {
+                if (may_mutate) state_ = std::move(previous);
+                throw;
+            }
+        }
+    } catch (const std::exception& error) {
+        result = {{"ok", false}, {"error", error.what()}};
+    } catch (...) {
+        result = {{"ok", false}, {"error", "unexpected_store_error"}};
+    }
+    callback = callback_;
+    lock.unlock();
+    if (!events.empty()) changed_.notify_all();
+    deliver(callback, events);
+    return result;
+}
+} // namespace knock
