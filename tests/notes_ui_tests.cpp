@@ -549,7 +549,8 @@ int main() {
         command(app.root, L"/find-note Compact layout");
         enter(edit(app.root, 51));
         eventually([&] { return IsWindowVisible(edit(app.root, 37)); }, "compact conversation opens");
-        entry_menu(app.root, 46, {VK_END, VK_UP, VK_RETURN});
+        require(caption(edit(app.root, 37)).empty(), "Compact conversation has an unexpected draft");
+        message(edit(app.root, 37), WM_KEYDOWN, VK_UP);
         eventually([&] { return buttons(app.root, L"SAVE EDIT").size() == 1; }, "image entry edit opens");
         require(buttons(app.root, L"x").size() == 1, "Attachment is missing from the compact edit draft");
         ctrl_find(app.root);
