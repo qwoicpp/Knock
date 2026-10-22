@@ -1,0 +1,8 @@
+#pragma once
+
+#include <string_view>
+
+namespace knock {
+// Generated from docs/AGENT_INSTRUCTIONS.md. No runtime file access is needed.
+inline constexpr std::string_view agent_info = R"knock_info(@KNOCK_AGENT_INFO@)knock_info";
+}

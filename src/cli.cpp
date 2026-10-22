@@ -1,4 +1,5 @@
 #include "knock/runner.hpp"
+#include "knock/agent_info.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -13,6 +14,7 @@ namespace {
 
 constexpr std::string_view help_text = R"(Knock — a local inbox for your agents
 
+  knock info                         Agent guide and token-saving workflow
   knock open
   knock status
   knock request --chat AUDIO-1 --message "May I use mouse and keyboard?"
@@ -40,7 +42,8 @@ Text can also come from UTF-8 files: --message-file, --body-file, --resume-file.
 Repeat --tag for multiple note labels; supplying tags replaces the selection.
 Notes are personal conversations. Add/update --body edits the description;
 append adds a message. Get returns a bounded, oldest-first message page.
-Commands return one UTF-8 JSON object. A request waits without model polling;
+Help and info print text; other commands return one UTF-8 JSON object.
+A request waits without model polling;
 --detach returns its ID immediately. A run always detaches and notifies on finish.
 Programs are executed directly. For shell syntax, explicitly use cmd.exe or
 powershell.exe after --. No shell is added by Knock.
@@ -48,6 +51,8 @@ powershell.exe after --. No shell is added by Knock.
 Request exit codes: 0 approved, 2 denied, 3 custom, 4 expired/released,
 5 error, 6 cancelled, 7 still pending. Only 0 with a live input lease permits input.
 Other successful commands return 0. A custom reply is never an approval.
+Run knock info once per agent session for the full usage guide.
+get-info is an alias for info.
 )";
 
 struct Arguments {
@@ -250,11 +255,18 @@ int edit_collection(const std::vector<std::wstring>& arguments, bool tasks) {
 } // namespace
 
 int run_cli(const std::vector<std::wstring>& arguments) {
-    if (arguments.empty() || arguments[0] == L"help" || arguments[0] == L"--help" || arguments[0] == L"-h") {
+    if (arguments.empty()) {
         std::cout << help_text;
         return 0;
     }
     const auto& action = arguments[0];
+    if (action == L"help" || action == L"--help" || action == L"-h" ||
+        action == L"info" || action == L"get-info") {
+        if (arguments.size() != 1)
+            throw std::runtime_error("Help and info take no arguments; use knock help or knock info");
+        std::cout << (action == L"info" || action == L"get-info" ? agent_info : help_text);
+        return 0;
+    }
     if (action == L"tasks" || action == L"notes") return edit_collection(arguments, action == L"tasks");
     const Arguments parsed(arguments, 1);
 

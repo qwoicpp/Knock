@@ -2,7 +2,13 @@
 
 Keep `knock.exe` and `KnockTray.exe` together. Run `KnockTray.exe` once, or use a CLI command: the CLI starts the tray automatically when needed. Add the extracted folder to the account PATH to make `knock` available from any project. The examples below assume that PATH entry; otherwise use the full path or `.\knock.exe` from the extracted folder.
 
-All commands except `help` write one UTF-8 JSON object to standard output. Non-ASCII characters use JSON escapes so older PowerShell output encodings cannot damage them; JSON decoding restores the original text. Text fields are ordinary text, not commands. Every request, notice, and background job requires an explicit chat label such as `AUDIO-1` to identify the conversation to resume.
+Run `knock info` once to get the agent instructions, examples, and advice for
+reducing model polling and unnecessary tool output. `knock get-info` is an
+alias. This guide is embedded in the executable: it works with the tray closed
+and does not open or change saved data. `knock help` gives a shorter command
+reference. Both commands take no arguments.
+
+All commands except help and info write one UTF-8 JSON object to standard output. Non-ASCII characters use JSON escapes so older PowerShell output encodings cannot damage them; JSON decoding restores the original text. Text fields are ordinary text, not commands. Every request, notice, and background job requires an explicit chat label such as `AUDIO-1` to identify the conversation to resume.
 
 ## Ask before using the desktop
 
@@ -142,6 +148,13 @@ a message or overwrite conversation history. Use `notes append` to add a message
 it accepts up to 64 KiB of UTF-8 text and requires non-whitespace content. Image
 import is handled in the app. CLI edits and interface edits use the same durable
 store, and concurrent appends retain all successfully saved messages.
+
+`notes remove NOTE_ID` moves the entire note into Trash, including its messages,
+tags, and image references. Restore it with Undo or the app's `/trash` page.
+Trash keeps notes for 30 days by default; Settings can change retention to
+1–365 days. Trashed notes no longer appear in `notes list`, and `notes get`,
+`append`, or `update` cannot access them until restored. Permanent deletion is
+an explicit action in the app.
 
 `notes list` returns note metadata, descriptions, and `message_count` without
 message history. `notes get` returns the chosen note with a chronological message
