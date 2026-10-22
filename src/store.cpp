@@ -51,10 +51,14 @@ Json default_preferences() {
             {"busy_until", 0}, {"trash_retention_days", 30}};
 }
 
+Json default_presence() {
+    return {{"state", "unknown"}, {"message", ""}, {"updated_at", 0}};
+}
+
 Json empty_state() {
     return {{"schema", 1}, {"requests", Json::array()}, {"jobs", Json::array()},
             {"tasks", Json::array()}, {"notes", Json::array()}, {"trash", Json::array()},
-            {"preferences", default_preferences()}, {"lease", nullptr}};
+            {"preferences", default_preferences()}, {"presence", default_presence()}, {"lease", nullptr}};
 }
 
 bool has_text(const std::string& value) {
@@ -240,6 +244,15 @@ void require_fields(const Json& record, std::initializer_list<const char*> field
     for (const auto* field : fields) {
         if (!record.contains(field)) throw std::runtime_error(std::string("missing_field: ") + field);
     }
+}
+
+void validate_presence(const Json& presence) {
+    if (!presence.is_object()) throw std::runtime_error("invalid_presence");
+    require_fields(presence, {"state", "message", "updated_at"});
+    if (!is_one_of(text_field(presence, "state", 16, true), {"unknown", "at_pc", "away", "busy"}))
+        throw std::runtime_error("invalid_presence_state");
+    text_field(presence, "message", 500);
+    integer_field(presence, "updated_at", 0, INT64_MAX, 0, true);
 }
 
 Json& find_record(Json& records, const std::string& id) {
@@ -554,6 +567,7 @@ void validate_state(const Json& state) {
         throw std::runtime_error("unsupported_state_schema");
     if (!state.contains("lease")) throw std::runtime_error("missing_lease");
     if (state.contains("preferences")) validate_preferences(state["preferences"]);
+    if (state.contains("presence")) validate_presence(state["presence"]);
     std::set<std::string> ids;
     for (const auto* collection : {"requests", "jobs", "tasks", "notes", "trash"}) {
         if (std::string_view(collection) == "trash" && !state.contains("trash")) continue;
@@ -785,6 +799,7 @@ void Store::load() {
     bool dirty = !exists;
     if (!loaded.contains("trash")) { loaded["trash"] = Json::array(); dirty = true; }
     if (!loaded.contains("preferences")) { loaded["preferences"] = default_preferences(); dirty = true; }
+    if (!loaded.contains("presence")) { loaded["presence"] = default_presence(); dirty = true; }
     const auto defaults = default_preferences();
     for (const auto& [key, value] : defaults.items()) {
         if (!loaded["preferences"].contains(key)) { loaded["preferences"][key] = value; dirty = true; }
@@ -912,6 +927,9 @@ Json Store::handle(const Json& command, bool trusted_ui) {
         if (op == "request.wait") {
             const auto id = id_field(command);
             const auto seconds = integer_field(command, "wait_seconds", 1, 86400, 86400);
+            if (command.contains("stop_when_unavailable") && !command["stop_when_unavailable"].is_boolean())
+                throw std::runtime_error("invalid_boolean: stop_when_unavailable");
+            const bool stop_when_unavailable = command.value("stop_when_unavailable", false);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
             for (;;) {
                 if (stopped_) throw std::runtime_error("store_stopped");
@@ -928,13 +946,18 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     result = {{"ok", true}, {"request", request}};
                     break;
                 }
+                if (stop_when_unavailable &&
+                    is_one_of(state_["presence"]["state"].get<std::string>(), {"away", "busy"})) {
+                    result = {{"ok", true}, {"request", request}, {"wait_reason", "presence"}};
+                    break;
+                }
                 const auto remaining = std::max<std::int64_t>(1, request["expires_at"].get<std::int64_t>() - now_ms());
                 const auto wake = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining));
                 changed_.wait_until(lock, wake);
             }
         } else {
             if (expire_locked()) events.push_back(event("updated"));
-            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.message.get", "note.trash.list", "note.search", "note.search_locations"});
+            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "presence.get", "list", "request.result", "job.result", "note.get", "note.find_message", "note.message.get", "note.trash.list", "note.search", "note.search_locations"});
             Json previous = may_mutate ? state_ : Json();
             bool dirty = false;
             Json notification;
@@ -942,7 +965,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                 const auto now = now_ms();
                 if (op == "snapshot") {
                     Json snapshot = Json::object();
-                    for (const auto* field : {"schema", "requests", "jobs", "tasks", "lease", "preferences"})
+                    for (const auto* field : {"schema", "requests", "jobs", "tasks", "lease", "preferences", "presence"})
                         snapshot[field] = state_[field];
                     snapshot["notes"] = Json::array();
                     for (const auto& note : state_["notes"])
@@ -963,6 +986,20 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     result = {{"ok", true}, {"preferences", state_["preferences"]}};
                     notification = event("updated");
                     notification["operation"] = op;
+                } else if (op == "presence.get") {
+                    result = {{"ok", true}, {"presence", state_["presence"]}};
+                } else if (op == "presence.update") {
+                    if (!trusted_ui) throw std::runtime_error("forbidden: GUI presence settings required");
+                    const auto presence_state = text_field(command, "state", 16, true);
+                    if (!is_one_of(presence_state, {"at_pc", "away", "busy"}))
+                        throw std::runtime_error("invalid_presence_state");
+                    const auto message = text_field(command, "message", 500);
+                    dirty = state_["presence"]["state"] != presence_state || state_["presence"]["message"] != message;
+                    if (dirty)
+                        state_["presence"] = {{"state", presence_state}, {"message", message}, {"updated_at", now}};
+                    result = {{"ok", true}, {"presence", state_["presence"]}};
+                    notification = event("updated");
+                    notification["operation"] = op;
                 } else if (op == "status") {
                     const auto count_status = [&](const char* collection, const char* status) {
                         const auto& records = state_[collection];
@@ -973,7 +1010,8 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     result = {{"ok", true}, {"requests_pending", count_status("requests", "pending")},
                               {"jobs_running", count_status("jobs", "running")},
                               {"tasks_todo", count_status("tasks", "todo")},
-                              {"notes", state_["notes"].size()}, {"lease", state_["lease"]}};
+                              {"notes", state_["notes"].size()}, {"lease", state_["lease"]},
+                              {"presence", state_["presence"]}};
                 } else if (op == "list") {
                     result = list_records(state_, command);
                 } else if (op == "note.trash.list") {
@@ -1305,6 +1343,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                 throw;
             }
         }
+        if (result.contains("request")) result["presence"] = state_["presence"];
     } catch (const std::exception& error) {
         result = {{"ok", false}, {"error", error.what()}};
     } catch (...) {

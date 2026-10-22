@@ -795,6 +795,190 @@ void preferences_are_validated_and_gui_owned() {
           cleared["trash_retention_days"] == 7, "could not disable busy mode and remove saved replies");
 }
 
+void presence_is_manual_validated_and_readable() {
+    Fixture f;
+    const Json initial{{"state", "unknown"}, {"message", ""}, {"updated_at", 0}};
+    check(f.store.snapshot()["presence"] == initial, "fresh state claimed a manual presence");
+    check(ok(f.store.handle({{"op", "presence.get"}}))["presence"] == initial &&
+          ok(f.store.handle({{"op", "status"}}))["presence"] == initial,
+          "presence readers disagreed with the snapshot");
+    std::vector<Json> events;
+    f.store.set_changed([&](const Json& event) { events.push_back(event); });
+    fails(f.store.handle({{"op", "presence.update"}, {"state", "at_pc"}}), "forbidden");
+    check(f.store.snapshot()["presence"] == initial && events.empty(), "untrusted command changed presence");
+
+    const Json command{{"op", "presence.update"}, {"state", "away"},
+        {"message", "Out for coffee — café 日本語. Continue headless tests."}};
+    const auto saved = ok(f.store.handle(command, true))["presence"];
+    check(saved["state"] == "away" && saved["message"] == command["message"] &&
+          saved["updated_at"].get<std::int64_t>() > 0, "manual presence lost Unicode text or timestamp");
+    check(events.size() == 1 && events[0]["type"] == "updated" && events[0]["operation"] == "presence.update",
+          "presence change did not emit a refresh event");
+    const auto before = f.store.snapshot();
+    const auto persisted = read_file(f.directory / "state.json");
+    check(ok(f.store.handle(command, true))["presence"] == saved && events.size() == 1 &&
+          read_file(f.directory / "state.json") == persisted, "no-op presence update changed its timestamp or emitted an event");
+
+    const std::vector<Json> invalid = {
+        {{"state", "unknown"}}, {{"state", "online"}}, {{"state", ""}}, {{"state", 1}},
+        {{"message", "missing state"}}, {{"state", "away"}, {"message", nullptr}},
+        {{"state", "away"}, {"message", std::string(501, 'x')}},
+        {{"state", "away"}, {"message", std::string("\xff", 1)}},
+        {{"state", "away"}, {"message", std::string("a\0b", 3)}}
+    };
+    for (auto invalid_command : invalid) {
+        invalid_command["op"] = "presence.update";
+        fails(f.store.handle(invalid_command, true));
+        check(f.store.snapshot() == before && events.size() == 1,
+              "invalid presence update partially changed state or emitted an event");
+    }
+    std::string boundary;
+    for (int index = 0; index < 250; ++index) boundary += "é";
+    check(ok(f.store.handle({{"op", "presence.update"}, {"state", "busy"}, {"message", boundary}}, true))
+              ["presence"]["message"] == boundary, "500-byte Unicode presence message was rejected");
+    fails(f.store.handle({{"op", "presence.update"}, {"state", "busy"}, {"message", boundary + "a"}}, true),
+          "field_too_long");
+    const auto cleared = ok(f.store.handle({{"op", "presence.update"}, {"state", "at_pc"}}, true))["presence"];
+    check(cleared["state"] == "at_pc" && cleared["message"] == "", "returning to the PC retained a stale message");
+}
+
+void presence_persistence_migration_and_rollback() {
+    Fixture f;
+    request(f.store);
+    ok(f.store.handle({{"op", "note.add"}, {"title", "Keep this note"}, {"body", "Keep its conversation too."}}));
+    const auto original = f.store.snapshot();
+    const auto path = f.directory / "state.json";
+    f.store.stop();
+    auto legacy = Json::parse(read_file(path));
+    legacy.erase("presence");
+    write_file(path, legacy.dump());
+    Store migrated(f.directory);
+    migrated.load();
+    check(migrated.snapshot() == original, "presence migration changed existing records or assumed availability");
+    check(Json::parse(read_file(path))["presence"] == original["presence"], "presence migration was not saved");
+    const auto saved = ok(migrated.handle({{"op", "presence.update"}, {"state", "away"},
+        {"message", "Coffee — back later. 日本語"}}, true))["presence"];
+    migrated.stop();
+    Store restarted(f.directory);
+    restarted.load();
+    check(restarted.snapshot()["presence"] == saved, "manual presence did not survive restart");
+
+    const auto before = restarted.snapshot();
+    unsigned int events = 0;
+    restarted.set_changed([&](const Json&) { ++events; });
+    const auto backup = f.directory / "saved.json";
+    std::filesystem::rename(path, backup);
+    std::filesystem::create_directory(path);
+    fails(restarted.handle({{"op", "presence.update"}, {"state", "at_pc"}}, true));
+    check(restarted.snapshot() == before && events == 0, "failed save changed presence or emitted a success event");
+    std::filesystem::remove(path);
+    std::filesystem::rename(backup, path);
+    ok(restarted.handle({{"op", "presence.update"}, {"state", "at_pc"}}, true));
+    check(events == 1, "presence did not recover after a failed save");
+    restarted.stop();
+
+    const auto valid = Json::parse(read_file(path));
+    const std::vector<Json> invalid = {
+        nullptr, "away", Json::object(),
+        {{"state", "gone"}, {"message", ""}, {"updated_at", 0}},
+        {{"state", "away"}, {"message", 1}, {"updated_at", 0}},
+        {{"state", "away"}, {"message", std::string(501, 'x')}, {"updated_at", 0}},
+        {{"state", "away"}, {"message", ""}, {"updated_at", -1}},
+        {{"state", "away"}, {"message", ""}, {"updated_at", 1.5}},
+        {{"state", "away"}, {"message", ""}}
+    };
+    for (const auto& presence : invalid) {
+        auto corrupt = valid;
+        corrupt["presence"] = presence;
+        const auto contents = corrupt.dump();
+        write_file(path, contents);
+        Store rejected(f.directory);
+        bool threw = false;
+        try { rejected.load(); } catch (...) { threw = true; }
+        check(threw && read_file(path) == contents, "invalid stored presence was accepted or overwritten");
+    }
+}
+
+void presence_does_not_change_permissions_or_quiet_hours() {
+    Fixture f;
+    ok(f.store.handle({{"op", "preferences.update"}, {"busy_until", knock::now_ms() + 900000}}, true));
+    const auto active = request(f.store);
+    ok(answer(f.store, active, "approved"));
+    const auto pending = request(f.store, "VIDEO-2");
+    auto unchanged = f.store.snapshot();
+    unchanged.erase("presence");
+    for (const auto* state : {"away", "busy", "at_pc"}) {
+        const auto presence = ok(f.store.handle({{"op", "presence.update"}, {"state", state}}, true))["presence"];
+        auto actual = f.store.snapshot();
+        actual.erase("presence");
+        check(actual == unchanged, "presence changed a lease, pending request, expiry, or quiet timer");
+        const auto result = ok(f.store.handle({{"op", "request.result"}, {"id", pending["id"]}}));
+        check(result["presence"] == presence && result["request"] == pending,
+              "request result omitted live presence or resolved a request");
+    }
+    const auto presence = ok(f.store.handle({{"op", "presence.get"}}))["presence"];
+    check(ok(f.store.handle({{"op", "request.release"}, {"id", active["id"]}}))["presence"] == presence,
+          "release response omitted live presence");
+    check(ok(f.store.handle({{"op", "request.cancel"}, {"id", pending["id"]}}))["presence"] == presence,
+          "cancel response omitted live presence");
+    const auto created = ok(f.store.handle({{"op", "request.create"}, {"chat", "AUDIO-1"},
+        {"message", "May I test the interface?"}}));
+    check(created["presence"] == presence && created["request"]["status"] == "pending" &&
+          created["request"]["lease_until"] == 0 && f.store.snapshot()["lease"].is_null(),
+          "At PC approved a new request or create omitted presence");
+    check(ok(answer(f.store, created["request"], "denied"))["presence"] == presence,
+          "decision response omitted live presence");
+}
+
+void presence_aware_waits_return_pending_without_resolving() {
+    Fixture f;
+    const auto pending = request(f.store);
+    const Json wait{{"op", "request.wait"}, {"id", pending["id"]}, {"wait_seconds", 5},
+        {"stop_when_unavailable", true}};
+    for (const auto& value : std::vector<Json>{nullptr, 0, 1, "true"}) {
+        auto invalid = wait;
+        invalid["stop_when_unavailable"] = value;
+        fails(f.store.handle(invalid), "invalid_boolean");
+    }
+    auto waiting = std::async(std::launch::async, [&] { return f.store.handle(wait); });
+    check(waiting.wait_for(30ms) == std::future_status::timeout, "unknown presence interrupted a wait");
+    ok(f.store.handle({{"op", "presence.update"}, {"state", "at_pc"}}, true));
+    check(waiting.wait_for(30ms) == std::future_status::timeout, "At PC interrupted a wait");
+    const auto path = f.directory / "state.json";
+    const auto backup = f.directory / "saved.json";
+    std::filesystem::rename(path, backup);
+    std::filesystem::create_directory(path);
+    fails(f.store.handle({{"op", "presence.update"}, {"state", "away"}}, true));
+    check(waiting.wait_for(30ms) == std::future_status::timeout, "failed presence save interrupted a wait");
+    std::filesystem::remove(path);
+    std::filesystem::rename(backup, path);
+    const auto away = ok(f.store.handle({{"op", "presence.update"}, {"state", "away"},
+        {"message", "Out for coffee. Continue headless tests."}}, true))["presence"];
+    check(waiting.wait_for(1s) == std::future_status::ready, "presence change did not wake an implicit waiter");
+    const auto result = ok(waiting.get());
+    check(result["request"] == pending && result["presence"] == away && result["wait_reason"] == "presence" &&
+          f.store.snapshot()["lease"].is_null(), "presence wake changed a pending request or created permission");
+    ok(f.store.handle({{"op", "presence.update"}, {"state", "busy"}}, true));
+    const auto busy = ok(f.store.handle(wait));
+    check(busy["request"] == pending && busy["presence"]["state"] == "busy" && busy["wait_reason"] == "presence",
+          "already-busy presence did not return the pending request");
+
+    auto explicit_wait = wait;
+    explicit_wait.erase("stop_when_unavailable");
+    auto explicit_waiter = std::async(std::launch::async, [&] { return f.store.handle(explicit_wait); });
+    check(explicit_waiter.wait_for(30ms) == std::future_status::timeout, "explicit wait returned early while busy");
+    ok(f.store.handle({{"op", "presence.update"}, {"state", "away"}}, true));
+    check(explicit_waiter.wait_for(30ms) == std::future_status::timeout, "presence transition interrupted an explicit wait");
+    const auto approved = ok(answer(f.store, pending, "approved"));
+    check(explicit_waiter.wait_for(1s) == std::future_status::ready, "decision did not release an explicit waiter");
+    const auto resolved = ok(explicit_waiter.get());
+    check(resolved["request"] == approved["request"] && resolved["presence"]["state"] == "away" &&
+          !resolved.contains("wait_reason"), "explicit wait omitted the decision or returned stale presence");
+    const auto immediate = ok(f.store.handle(wait));
+    check(immediate["request"] == approved["request"] && !immediate.contains("wait_reason"),
+          "presence hid an existing approval from an implicit waiter");
+}
+
 void note_trash_restore_and_purge() {
     Fixture f;
     const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Websites 日本語"},
@@ -1108,6 +1292,10 @@ int main() {
         {"corrupt state preservation", corruption_is_preserved},
         {"cancellation and archiving", cancellation_and_archiving},
         {"GUI preferences validation and persistence", preferences_are_validated_and_gui_owned},
+        {"manual presence validation and readers", presence_is_manual_validated_and_readable},
+        {"presence persistence, migration, and rollback", presence_persistence_migration_and_rollback},
+        {"presence stays separate from permission and quiet timers", presence_does_not_change_permissions_or_quiet_hours},
+        {"presence-aware waits preserve pending requests", presence_aware_waits_return_pending_without_resolving},
         {"note trash restore and permanent deletion", note_trash_restore_and_purge},
         {"trash retention, migration, and save rollback", trash_retention_migration_and_rollback},
         {"message edits preserve append identity", message_edits_keep_identity_and_append_retries},
