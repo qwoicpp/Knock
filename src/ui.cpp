@@ -188,6 +188,7 @@ public:
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
             if (message.message == WM_KEYDOWN && (message.hwnd == window_ || IsChild(window_, message.hwnd))) {
                 if (message.wParam == VK_ESCAPE) { escape(); continue; }
+                if (note_keys(message.hwnd, message.wParam)) continue;
                 if (message.wParam == VK_RETURN && message.hwnd == footer_edit_) { add_item(); continue; }
                 if (message.wParam == VK_RETURN && message.hwnd == tag_query_edit_) { activate_tag_query(); continue; }
                 if (message.wParam == VK_RETURN && settings_open_ &&
@@ -218,6 +219,7 @@ private:
     enum class Tab { notifications, tasks, notes };
     enum class Detail { none, task, note };
     enum class SaveIntent { explicit_action, background };
+    enum class NotePage { list, find, remove };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
         HWND handle = nullptr;
@@ -229,6 +231,7 @@ private:
         bool hover = false;
         bool card = false;
         bool left_aligned = false;
+        bool note_result = false;
         Icon icon = Icon::none;
         Json record;
     };
@@ -284,6 +287,18 @@ private:
     HWND reply_edit_ = nullptr;
     HWND tag_query_edit_ = nullptr;
     HWND composer_edit_ = nullptr;
+    HWND note_query_edit_ = nullptr;
+    NotePage note_page_ = NotePage::list;
+    std::vector<Json> note_results_;
+    std::string note_selected_id_;
+    int note_result_offset_ = 0;
+    int note_result_rows_ = 1;
+    RECT note_results_bounds_{};
+    bool dragging_note_results_ = false;
+    std::vector<NotePage> note_command_choices_;
+    std::size_t note_command_selection_ = 0;
+    RECT note_command_bounds_{};
+    ULONGLONG note_delete_click_until_ = 0;
     bool note_metadata_open_ = false;
     bool note_draft_dirty_ = false;
     NoteDraft note_draft_;
@@ -347,7 +362,7 @@ private:
         small_font_ = make(10, FW_NORMAL);
         title_font_ = make(13, FW_NORMAL);
         for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_,
-                          settings_width_edit_, settings_height_edit_})
+                          settings_width_edit_, settings_height_edit_, note_query_edit_})
             if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), TRUE);
     }
     void text(HDC dc, const std::wstring& value, RECT bounds, HFONT font,
@@ -774,7 +789,7 @@ private:
         detail_ = Detail::none;
         destroy_detail_edits();
         layout();
-        SetFocus(window_);
+        SetFocus(note_page_visible() ? note_query_edit_ : window_);
     }
     void delete_detail() {
         auto text = detail_ == Detail::note ? L"Delete this note?" : L"Delete this task?";
@@ -806,6 +821,7 @@ private:
         if (!footer_edit_) return;
         std::string title = trim(narrow(edit_text(footer_edit_)));
         if (title.empty()) { SetFocus(footer_edit_); return; }
+        if (tab_ == Tab::notes && title.front() == '/') { run_note_command(title); return; }
         auto command = Json{{"op", tab_ == Tab::tasks ? "task.add" : "note.add"}, {"title", title}};
         if (tab_ == Tab::notes && !note_filter_.empty()) command["tags"] = Json::array({note_filter_});
         auto result = mutate(command);
@@ -813,6 +829,140 @@ private:
         SetWindowTextW(footer_edit_, L"");
         scroll() = 0;
         if (tab_ == Tab::notes) begin_detail(Detail::note, result["note"]);
+    }
+    bool note_page_visible() const {
+        return !settings_open_ && tab_ == Tab::notes && detail_ == Detail::none && note_page_ != NotePage::list;
+    }
+    static const char* note_command_name(NotePage page) {
+        return page == NotePage::remove ? "/delete-note" : "/find-note";
+    }
+    void open_note_page(NotePage page, const std::string& query = {}) {
+        if (!save_detail()) return;
+        feedback_.clear();
+        reset_tag_picker();
+        note_page_ = page;
+        note_result_offset_ = 0;
+        note_selected_id_.clear();
+        if (!note_query_edit_) note_query_edit_ = make_edit(content_, 51, false, L"Find a note by name...");
+        populating_ = true;
+        SetWindowTextW(note_query_edit_, widen(query).c_str());
+        if (footer_edit_) SetWindowTextW(footer_edit_, L"");
+        populating_ = false;
+        layout();
+        SetFocus(note_query_edit_);
+        SendMessageW(note_query_edit_, EM_SETSEL, query.empty() ? 0 : -1, -1);
+    }
+    void close_note_page() {
+        note_page_ = NotePage::list;
+        note_results_.clear();
+        note_selected_id_.clear();
+        if (note_query_edit_) DestroyWindow(note_query_edit_);
+        note_query_edit_ = nullptr;
+        layout();
+        SetFocus(footer_edit_ ? footer_edit_ : window_);
+    }
+    void run_note_command(const std::string& value) {
+        update_note_command_choices();
+        const auto split = value.find_first_of(" \t");
+        const auto name = tag_key(value.substr(0, split));
+        const auto query = split == std::string::npos ? std::string() : trim(value.substr(split + 1));
+        for (NotePage page : {NotePage::find, NotePage::remove}) {
+            if (name == note_command_name(page)) { open_note_page(page, query); return; }
+        }
+        if (split == std::string::npos && !note_command_choices_.empty()) {
+            open_note_page(note_command_choices_[note_command_selection_]);
+            return;
+        }
+        feedback(L"Unknown note command. Use /find-note or /delete-note.");
+        SetFocus(footer_edit_);
+    }
+    void update_note_command_choices() {
+        note_command_choices_.clear();
+        if (settings_open_ || tab_ != Tab::notes || detail_ != Detail::none || note_page_ != NotePage::list || !footer_edit_) return;
+        const auto value = tag_key(trim(narrow(edit_text(footer_edit_))));
+        if (value.empty() || value.front() != '/') return;
+        const auto split = value.find_first_of(" \t");
+        const auto prefix = value.substr(0, split);
+        for (NotePage page : {NotePage::find, NotePage::remove})
+            if (std::string(note_command_name(page)).starts_with(prefix)) note_command_choices_.push_back(page);
+        note_command_selection_ = std::min(note_command_selection_, note_command_choices_.empty() ? 0 : note_command_choices_.size() - 1);
+    }
+    void update_note_results() {
+        const auto query = widen(trim(narrow(edit_text(note_query_edit_))));
+        struct Match { Json item; int rank; };
+        std::vector<Match> matches;
+        for (const auto& item : snapshot_["notes"]) {
+            const auto name = widen(get_string(item, "title"));
+            const int position = query.empty() ? 0 : FindStringOrdinal(FIND_FROMSTART,
+                name.c_str(), static_cast<int>(name.size()), query.c_str(), static_cast<int>(query.size()), TRUE);
+            if (position >= 0) matches.push_back({item, position == 0 ? (name.size() == query.size() ? 0 : 1) : 2});
+        }
+        std::stable_sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
+            if (a.rank != b.rank) return a.rank < b.rank;
+            return a.item.value("updated_at", std::int64_t(0)) > b.item.value("updated_at", std::int64_t(0));
+        });
+        note_results_.clear();
+        for (auto& match : matches) note_results_.push_back(std::move(match.item));
+        const bool selected_exists = std::any_of(note_results_.begin(), note_results_.end(), [this](const Json& item) {
+            return get_string(item, "id") == note_selected_id_;
+        });
+        if (!selected_exists) note_selected_id_ = note_results_.empty() ? std::string() : get_string(note_results_.front(), "id");
+    }
+    void scroll_note_results(int rows) {
+        const int offset = std::clamp(note_result_offset_ + rows, 0,
+            std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_));
+        if (offset == note_result_offset_) return;
+        note_result_offset_ = offset;
+        layout();
+    }
+    void move_note_selection(int amount) {
+        if (note_results_.empty()) return;
+        auto selected = std::find_if(note_results_.begin(), note_results_.end(), [this](const Json& item) {
+            return get_string(item, "id") == note_selected_id_;
+        });
+        const int index = std::clamp(static_cast<int>(selected - note_results_.begin()) + amount,
+            0, static_cast<int>(note_results_.size()) - 1);
+        note_selected_id_ = get_string(note_results_[static_cast<std::size_t>(index)], "id");
+        if (index < note_result_offset_) note_result_offset_ = index;
+        if (index >= note_result_offset_ + note_result_rows_) note_result_offset_ = index - note_result_rows_ + 1;
+        layout();
+    }
+    void activate_note_result(const Json& item) {
+        const auto id = get_string(item, "id");
+        if (note_page_ == NotePage::find) {
+            note_selected_id_ = id;
+            begin_detail(Detail::note, item);
+            return;
+        }
+        if (note_page_ != NotePage::remove || GetTickCount64() < note_delete_click_until_) return;
+        if (!mutate({{"op", "note.delete"}, {"id", id}}).value("ok", false)) return;
+        // Rows move after deletion; ignore the second half of a double-click.
+        note_delete_click_until_ = GetTickCount64() + GetDoubleClickTime();
+        snapshot_ = store_.snapshot();
+        feedback(L"Deleted " + widen(get_string(item, "title")) + L".");
+        layout();
+        SetFocus(note_query_edit_);
+    }
+    bool note_keys(HWND target, WPARAM key) {
+        if (target == footer_edit_ && !note_command_choices_.empty() && (key == VK_UP || key == VK_DOWN)) {
+            if (key == VK_UP) note_command_selection_ = (note_command_selection_ + note_command_choices_.size() - 1) % note_command_choices_.size();
+            else note_command_selection_ = (note_command_selection_ + 1) % note_command_choices_.size();
+            layout();
+            return true;
+        }
+        if (target != note_query_edit_ || !note_page_visible()) return false;
+        if (key == VK_UP || key == VK_DOWN) { move_note_selection(key == VK_UP ? -1 : 1); return true; }
+        if (key == VK_RETURN) {
+            // Deletion is an explicit row action, never a side effect of typing a query.
+            if (note_page_ == NotePage::find) {
+                auto selected = std::find_if(note_results_.begin(), note_results_.end(), [this](const Json& item) {
+                    return get_string(item, "id") == note_selected_id_;
+                });
+                if (selected != note_results_.end()) activate_note_result(*selected);
+            }
+            return true;
+        }
+        return false;
     }
     bool note_matches(const Json& note) const {
         const auto tags = tags_of(note);
@@ -1357,7 +1507,8 @@ private:
         model.active = active;
         model.card = !card.is_null();
         model.left_aligned = key.starts_with("tag-choice:") || key == "tag-all" || key == "tag-untagged" ||
-            key == "settings-startup";
+            key == "settings-startup" || key.starts_with("note-command:");
+        model.note_result = key.starts_with("note-result:");
         model.record = card;
         model.icon = icon;
         SetWindowTextW(model.handle, label.c_str());
@@ -1430,7 +1581,19 @@ private:
             draw_tab_icon(item.hDC, button.icon, px(12), (bounds.bottom - px(14)) / 2, color);
         } else fill(item.hDC, bounds, bg);
         if (!button.tab) outline(item.hDC, bounds, button.hover || (item.itemState & ODS_FOCUS) ? muted : border);
-        if (button.card) {
+        if (button.note_result) {
+            const bool deleting = note_page_ == NotePage::remove;
+            text(item.hDC, widen(get_string(button.record, "title")),
+                RECT{px(8), px(6), bounds.right - px(65), px(24)}, body_font_, foreground,
+                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            text(item.hDC, deleting ? L"DELETE" : L"OPEN",
+                RECT{bounds.right - px(61), px(6), bounds.right - px(8), px(24)}, small_font_, deleting ? orange : muted,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            auto caption = tag_caption(tags_of(button.record));
+            if (caption.empty()) caption = L"Untagged";
+            text(item.hDC, caption, RECT{px(8), px(28), bounds.right - px(8), bounds.bottom - px(5)},
+                small_font_, muted, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        } else if (button.card) {
             auto title = (tab_ == Tab::tasks ? L"TASK: " : L"") + widen(get_string(button.record, "title"));
             RECT title_bounds{px(7), px(6), bounds.right - px(7), px(25)};
             text(item.hDC, title, title_bounds, title_font_, foreground, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1498,9 +1661,9 @@ private:
             });
             top += px(28);
         }
-        bool footer = !settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none;
+        bool footer = !settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none && !note_page_visible();
         notes_bar_y_ = 0;
-        if (!settings_open_ && tab_ == Tab::notes && detail_ == Detail::none) {
+        if (!settings_open_ && tab_ == Tab::notes && detail_ == Detail::none && !note_page_visible()) {
             notes_bar_y_ = top;
             button("notes-filter", window_, L"FILTER", rect(px(12), top, px(64), px(22)),
                 [this] { open_tag_picker(); }, true, false, tag_picker_open_);
@@ -1508,17 +1671,28 @@ private:
                 [this](const Json& note) { return note_matches(note); }));
             top += px(31);
         }
-        int bottom = footer ? px(44) : px(12);
+        update_note_command_choices();
+        note_command_bounds_ = {};
+        int suggestions_height = 0;
+        if (footer && tab_ == Tab::notes && footer_edit_) {
+            const auto value = trim(narrow(edit_text(footer_edit_)));
+            if (!value.empty() && value.front() == '/') {
+                suggestions_height = px(note_command_choices_.empty() ? 49 : 10 + 29 * static_cast<int>(note_command_choices_.size()));
+                note_command_bounds_ = RECT{px(12), height - px(44) - suggestions_height, width - px(12), height - px(47)};
+            }
+        }
+        int bottom = footer ? px(44) + suggestions_height : px(12);
         MoveWindow(content_, px(12), top, width - px(24), std::max(px(80), height - top - bottom), FALSE);
         RECT area{};
         GetClientRect(content_, &area);
         viewport_height_ = area.bottom;
         if (footer) {
             if (!footer_edit_) footer_edit_ = make_edit(window_, 30, false,
-                tab_ == Tab::tasks ? L"New task..." : L"New note, e.g. Websites...");
+                tab_ == Tab::tasks ? L"New task..." : L"New note, or / for commands...");
             MoveWindow(footer_edit_, px(12), height - px(30), width - px(91), px(22), FALSE);
             ShowWindow(footer_edit_, SW_SHOW);
         } else if (footer_edit_) ShowWindow(footer_edit_, SW_HIDE);
+        if (note_query_edit_) ShowWindow(note_query_edit_, note_page_visible() ? SW_SHOW : SW_HIDE);
         if (settings_open_) {
             for (HWND edit : {title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_,
                               tag_query_edit_, composer_edit_}) if (edit) ShowWindow(edit, SW_HIDE);
@@ -1526,8 +1700,24 @@ private:
         }
         else if (detail_ != Detail::none) layout_detail(area);
         else if (tab_ == Tab::notifications) layout_notifications(area);
+        else if (note_page_visible()) layout_note_page(area);
         else if (tag_picker_open_) { content_height_ = area.bottom; layout_tag_picker(area); }
         else layout_cards(area);
+        if (suggestions_height && !note_command_choices_.empty()) {
+            for (std::size_t i = 0; i < note_command_choices_.size(); ++i) {
+                const auto page = note_command_choices_[i];
+                const auto label = widen(note_command_name(page)) +
+                    (page == NotePage::find ? L"  Find a note by name" : L"  Delete notes with a click");
+                button("note-command:" + std::string(note_command_name(page)), window_, label,
+                    rect(note_command_bounds_.left + px(4), note_command_bounds_.top + px(4) + static_cast<int>(i) * px(29),
+                         note_command_bounds_.right - note_command_bounds_.left - px(8), px(23)),
+                    [this, page] {
+                        const auto value = trim(narrow(edit_text(footer_edit_)));
+                        const auto split = value.find_first_of(" \t");
+                        open_note_page(page, split == std::string::npos ? std::string() : trim(value.substr(split + 1)));
+                    }, true, false, i == note_command_selection_);
+            }
+        }
         if (reply_edit_ && (settings_open_ || tab_ != Tab::notifications || detail_ != Detail::none))
             ShowWindow(reply_edit_, SW_HIDE);
         sweep_buttons();
@@ -1574,6 +1764,31 @@ private:
         outline(dc, rect(field_width + px(12), px(175), field_width, px(28)), border);
         text(dc, L"360-800 x 360-1000", RECT{0, px(210), area.right - px(94), px(233)}, small_font_, subdued,
              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    }
+    void layout_note_page(RECT area) {
+        content_height_ = area.bottom;
+        update_note_results();
+        button("note-command-back", content_, L"< BACK", rect(0, px(2), px(64), px(22)), [this] { close_note_page(); });
+        MoveWindow(note_query_edit_, px(5), px(39), area.right - px(10), px(22), FALSE);
+        note_result_rows_ = std::max(1, (static_cast<int>(area.bottom) - px(131)) / px(58));
+        note_result_offset_ = std::clamp(note_result_offset_, 0,
+            std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_));
+        note_results_bounds_ = RECT{0, px(96), area.right, px(96) + note_result_rows_ * px(58) - px(8)};
+        const int end = std::min(static_cast<int>(note_results_.size()), note_result_offset_ + note_result_rows_);
+        for (int i = note_result_offset_; i < end; ++i) {
+            const auto item = note_results_[static_cast<std::size_t>(i)];
+            const auto id = get_string(item, "id");
+            const auto label = (note_page_ == NotePage::remove ? L"DELETE " : L"") + widen(get_string(item, "title"));
+            button("note-result:" + id, content_, label,
+                rect(0, note_results_bounds_.top + (i - note_result_offset_) * px(58), area.right - px(8), px(50)),
+                [this, item] { activate_note_result(item); }, true, false, id == note_selected_id_, item);
+        }
+        if (static_cast<int>(note_results_.size()) > note_result_rows_) {
+            button("note-page-up", content_, L"UP", rect(area.right - px(110), area.bottom - px(24), px(45), px(22)),
+                [this] { scroll_note_results(-note_result_rows_); }, note_result_offset_ > 0);
+            button("note-page-down", content_, L"DOWN", rect(area.right - px(58), area.bottom - px(24), px(58), px(22)),
+                [this] { scroll_note_results(note_result_rows_); }, end < static_cast<int>(note_results_.size()));
+        }
     }
     void layout_detail(RECT area) {
         if (detail_ == Detail::note) { layout_note(area); return; }
@@ -1781,10 +1996,19 @@ private:
                  RECT{area.right - px(75), notes_bar_y_, area.right - px(12), notes_bar_y_ + px(22)}, small_font_, subdued,
                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         }
-        if (!settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none) {
+        if (!settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none && !note_page_visible()) {
             fill(dc, RECT{px(12), area.bottom - px(43), area.right - px(12), area.bottom - px(43) + 1}, border);
             text(dc, L"Enter", RECT{area.right - px(67), area.bottom - px(30), area.right - px(15), area.bottom - px(8)},
                  small_font_, subdued, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (note_command_bounds_.bottom > note_command_bounds_.top) {
+            fill(dc, note_command_bounds_, background);
+            outline(dc, note_command_bounds_, border);
+            if (note_command_choices_.empty()) {
+                auto bounds = note_command_bounds_;
+                InflateRect(&bounds, -px(8), -px(6));
+                text(dc, L"No matching command.\nTry /find-note or /delete-note.", bounds, small_font_, muted);
+            }
         }
     }
     void draw_content(HDC dc) {
@@ -1794,6 +2018,7 @@ private:
         if (settings_open_) draw_settings(dc, area);
         else if (detail_ != Detail::none) draw_detail(dc, area);
         else if (tab_ == Tab::notifications) draw_notifications(dc, area);
+        else if (note_page_visible()) draw_note_page(dc, area);
         else if (tag_picker_open_) draw_tag_picker(dc);
         else if ((tab_ == Tab::tasks && snapshot_["tasks"].empty()) || (tab_ == Tab::notes && !visible_note_count_)) {
             auto heading = tab_ == Tab::tasks ? L"No tasks yet." : untagged_filter_ ? L"No untagged notes." :
@@ -1813,10 +2038,42 @@ private:
             if (detail_ == Detail::note && !note_metadata_open_ && !tag_picker_open_)
                 box = RECT{px(3), std::max(note_history_bounds_.top, note_history_bounds_.bottom - px(46)),
                            area.right - px(3), note_history_bounds_.bottom - px(3)};
+            else if (note_page_visible())
+                box = RECT{px(3), area.bottom - px(65), area.right - px(3), area.bottom - px(30)};
             fill(dc, box, top_background);
             outline(dc, box, border);
             InflateRect(&box, -px(6), -px(5));
             text(dc, feedback_, box, small_font_, foreground, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+    }
+    void draw_note_page(HDC dc, RECT area) const {
+        text(dc, widen(note_command_name(note_page_)), RECT{px(77), px(2), area.right, px(24)},
+            body_font_, foreground, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        outline(dc, RECT{0, px(35), area.right, px(65)}, border);
+        text(dc, note_page_ == NotePage::remove ? L"Click a note to delete it." : L"Search names. Enter opens a note.",
+            RECT{0, px(72), area.right - px(94), px(89)}, small_font_, note_page_ == NotePage::remove ? orange : muted,
+            DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        text(dc, std::to_wstring(note_results_.size()) + (note_results_.size() == 1 ? L" match" : L" matches"),
+            RECT{area.right - px(88), px(72), area.right, px(89)}, small_font_, muted,
+            DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
+        if (note_results_.empty()) {
+            const bool empty = snapshot_["notes"].empty();
+            text(dc, empty ? L"No notes yet." : L"No matching notes.",
+                RECT{px(8), px(115), area.right - px(8), px(142)}, title_font_);
+            text(dc, empty ? L"Go back to create a note." : L"Try another part of the name.",
+                RECT{px(8), px(147), area.right - px(8), px(188)}, body_font_, muted);
+        }
+        if (static_cast<int>(note_results_.size()) > note_result_rows_) {
+            const int height = note_results_bounds_.bottom - note_results_bounds_.top;
+            const int total = static_cast<int>(note_results_.size());
+            const int thumb = std::max(px(20), height * note_result_rows_ / total);
+            const int top = note_results_bounds_.top + (height - thumb) * note_result_offset_ / (total - note_result_rows_);
+            fill(dc, RECT{area.right - std::max(1, px(1)), top, area.right, top + thumb}, border);
+            const auto first = std::to_wstring(note_result_offset_ + 1);
+            const auto last = std::to_wstring(std::min(total, note_result_offset_ + note_result_rows_));
+            text(dc, first + L" - " + last + L" of " + std::to_wstring(total),
+                RECT{0, area.bottom - px(24), area.right - px(123), area.bottom - px(2)}, small_font_, subdued,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
     struct EditorScroll { RECT bounds{}; int first = 0; int total = 0; int visible = 0; };
@@ -2019,6 +2276,10 @@ private:
     }
     void scroll_by(int amount) {
         if (settings_open_ || tag_picker_open_) return;
+        if (note_page_visible()) {
+            scroll_note_results(amount > 0 ? note_result_rows_ : -note_result_rows_);
+            return;
+        }
         if (detail_ == Detail::note && !note_metadata_open_) {
             const int next = std::clamp(note_scroll_ + amount, 0, note_scroll_limit());
             if (next != note_scroll_) { note_scroll_ = next; layout(); }
@@ -2036,6 +2297,7 @@ private:
         else if (detail_ == Detail::note && note_metadata_open_) open_note_metadata();
         else if (reply_edit_ && tab_ == Tab::notifications) cancel_reply();
         else if (detail_ != Detail::none) leave_detail();
+        else if (note_page_visible()) close_note_page();
         else hide();
     }
     void changed(const Json& event) {
@@ -2111,6 +2373,15 @@ private:
             note_draft_dirty_ = true;
             SetTimer(window_, 4, 600, nullptr);
         }
+        if (event == EN_CHANGE && !populating_ && id == 30 && tab_ == Tab::notes) {
+            note_command_selection_ = 0;
+            layout();
+        }
+        if (event == EN_CHANGE && !populating_ && id == 51) {
+            note_selected_id_.clear();
+            note_result_offset_ = 0;
+            layout();
+        }
         return 0;
     }
     LRESULT message(HWND target, UINT message, WPARAM wparam, LPARAM lparam, bool content) {
@@ -2140,11 +2411,16 @@ private:
             int steps = wheel_remainder_ / WHEEL_DELTA;
             wheel_remainder_ %= WHEEL_DELTA;
             if (tag_picker_open_) scroll_tags(-steps * 2);
+            else if (note_page_visible()) scroll_note_results(-steps * 3);
             else scroll_by(-steps * px(48));
             return 0;
         }
         if (message == WM_KEYDOWN) {
             if (wparam == VK_ESCAPE) { escape(); return 0; }
+            if (note_page_visible() && GetKeyState(VK_CONTROL) < 0 && (wparam == VK_HOME || wparam == VK_END)) {
+                scroll_note_results(wparam == VK_HOME ? -static_cast<int>(note_results_.size()) : static_cast<int>(note_results_.size()));
+                return 0;
+            }
             const bool conversation = detail_ == Detail::note && !note_metadata_open_;
             const int page = conversation ? note_history_bounds_.bottom - note_history_bounds_.top : viewport_height_;
             const int extent = conversation ? note_history_height_ : content_height_;
@@ -2155,6 +2431,15 @@ private:
         }
         if (content) {
             if (message == WM_LBUTTONDOWN) {
+                if (note_page_visible() && static_cast<int>(note_results_.size()) > note_result_rows_ &&
+                    GET_X_LPARAM(lparam) >= note_results_bounds_.right - px(10) &&
+                    GET_Y_LPARAM(lparam) >= note_results_bounds_.top && GET_Y_LPARAM(lparam) < note_results_bounds_.bottom) {
+                    dragging_note_results_ = true;
+                    drag_start_y_ = GET_Y_LPARAM(lparam);
+                    drag_start_scroll_ = note_result_offset_;
+                    SetCapture(content_);
+                    return 0;
+                }
                 for (HWND editor : {body_edit_, reply_edit_, composer_edit_}) {
                     if (editor_gutter(editor, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam))) {
                         dragging_editor_ = editor;
@@ -2177,6 +2462,14 @@ private:
                     if (!filename.empty()) { open_note_image(filename); return 0; }
                 }
             }
+            if (message == WM_MOUSEMOVE && dragging_note_results_) {
+                const int height = note_results_bounds_.bottom - note_results_bounds_.top;
+                const int target_scroll = drag_start_scroll_ + MulDiv(GET_Y_LPARAM(lparam) - drag_start_y_,
+                    static_cast<int>(note_results_.size()), std::max(1, height));
+                scroll_note_results(target_scroll - note_result_offset_);
+                return 0;
+            }
+            if (message == WM_LBUTTONUP && dragging_note_results_) { dragging_note_results_ = false; ReleaseCapture(); return 0; }
             if (message == WM_MOUSEMOVE && dragging_editor_) { scroll_editor(dragging_editor_, GET_Y_LPARAM(lparam)); return 0; }
             if (message == WM_LBUTTONUP && dragging_editor_) { dragging_editor_ = nullptr; ReleaseCapture(); return 0; }
             if (message == WM_MOUSEMOVE && dragging_note_scroll_) {
@@ -2191,6 +2484,7 @@ private:
                 dragging_editor_ = nullptr;
                 dragging_scroll_ = false;
                 dragging_note_scroll_ = false;
+                dragging_note_results_ = false;
             }
             if (message == WM_LBUTTONDOWN && !settings_open_ && detail_ == Detail::none) {
                 RECT area{}; GetClientRect(content_, &area);
@@ -2310,6 +2604,8 @@ private:
     static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data) {
         auto* app = reinterpret_cast<App*>(data);
         if (message == WM_CONTEXTMENU) { app->app_context_menu(window, lparam); return 0; }
+        if (message == WM_MOUSEWHEEL && window == app->note_query_edit_)
+            return SendMessageW(app->window_, message, wparam, lparam);
         if (message == WM_PASTE && window == app->composer_edit_ && app->paste_note_attachment()) return 0;
         if (message == WM_CHAR && wparam == 0x16 && window == app->composer_edit_) {
             SendMessageW(window, WM_PASTE, 0, 0); return 0;
@@ -2321,6 +2617,7 @@ private:
         }
         if (message == WM_KEYDOWN) {
             if (wparam == VK_ESCAPE) { app->escape(); return 0; }
+            if (app->note_keys(window, wparam)) return 0;
             if (wparam == VK_INSERT && GetKeyState(VK_SHIFT) < 0 && window == app->composer_edit_) {
                 SendMessageW(window, WM_PASTE, 0, 0); return 0;
             }
@@ -2339,7 +2636,7 @@ private:
             }
         }
         if (message == WM_CHAR && (wparam == VK_ESCAPE || (wparam == VK_RETURN &&
-            (window == app->footer_edit_ || window == app->tag_query_edit_ ||
+            (window == app->footer_edit_ || window == app->tag_query_edit_ || window == app->note_query_edit_ ||
              window == app->settings_width_edit_ || window == app->settings_height_edit_ || GetKeyState(VK_CONTROL) < 0 ||
              (window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0))))) return 0;
         return DefSubclassProc(window, message, wparam, lparam);
