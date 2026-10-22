@@ -477,6 +477,23 @@ Json search_notes(const Json& state, const Json& command) {
     return result;
 }
 
+Json note_search_locations(const Json& note, const Json& command) {
+    const NoteMatcher matcher(text_field(command, "query", 512, true));
+    Json items = Json::array();
+    const auto& messages = note["messages"];
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        const auto& message = messages[index];
+        if (matcher.find(message["text"].get_ref<const std::string&>()))
+            items.push_back({{"message_id", message["id"]}, {"message_index", index}});
+    }
+    const auto count = items.size();
+    Json result{{"ok", true}, {"items", std::move(items)}, {"total", count}};
+    // At most 2000 IDs of at most 128 bytes fit comfortably. Keep the response
+    // bound explicit if those storage limits are ever increased.
+    if (result.dump().size() > max_list_bytes) throw std::runtime_error("search_locations_exceed_page_budget");
+    return result;
+}
+
 void room_for_record(const Json& records) {
     if (records.size() >= max_records) throw std::runtime_error("history_limit_reached");
 }
@@ -917,7 +934,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
             }
         } else {
             if (expire_locked()) events.push_back(event("updated"));
-            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.message.get", "note.trash.list", "note.search"});
+            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.message.get", "note.trash.list", "note.search", "note.search_locations"});
             Json previous = may_mutate ? state_ : Json();
             bool dirty = false;
             Json notification;
@@ -994,6 +1011,9 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     result = read_note(find_record(state_["notes"], id_field(command)), command);
                 } else if (op == "note.search") {
                     result = search_notes(state_, command);
+                } else if (op == "note.search_locations") {
+                    if (!trusted_ui) throw std::runtime_error("forbidden: GUI search required");
+                    result = note_search_locations(find_record(state_["notes"], id_field(command)), command);
                 } else if (op == "note.message.get") {
                     const auto note_id = id_field(command);
                     const auto& note = find_record(state_["notes"], note_id);

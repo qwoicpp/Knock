@@ -1041,6 +1041,45 @@ void note_search_bounds_and_current_content() {
     check(ok(f.store.handle({{"op", "note.search"}, {"query", "needle"}}))["total"] == 0,
           "text search treated an attachment filename as a message");
 }
+
+void note_search_locations_are_trusted_and_complete() {
+    Fixture f;
+    const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Find in a full conversation"}}))["note"];
+    f.store.stop();
+    const auto path = f.directory / "state.json";
+    auto state = Json::parse(read_file(path));
+    auto& messages = state["notes"][0]["messages"];
+    for (int index = 0; index < 2000; ++index) {
+        auto id = "entry-" + std::to_string(index);
+        id.append(128 - id.size(), 'x');
+        messages.push_back({{"id", id}, {"text", "CAFÉ 日本語🧪"}, {"images", Json::array()},
+            {"created_at", index}, {"revision", 0}});
+    }
+    write_file(path, state.dump());
+    Store restarted(f.directory);
+    restarted.load();
+    const auto before = read_file(path);
+    const Json command{{"op", "note.search_locations"}, {"id", note["id"]}, {"query", "café 日本語🧪"}};
+    fails(restarted.handle(command), "forbidden");
+    const auto results = ok(restarted.handle(command, true));
+    check(results["total"] == 2000 && results["items"].size() == 2000 && !results.contains("next_offset"),
+          "in-note search did not return every matching message in one result");
+    check(results.dump().size() < 800 * 1024, "longest message IDs exceeded the response budget");
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        const auto& item = results["items"][index];
+        check(item.size() == 2 && item["message_id"] == messages[index]["id"] && item["message_index"] == index,
+              "locations contained content or changed chronological positions");
+    }
+    check(read_file(path) == before, "location search rewrote state");
+    auto empty = command;
+    empty["query"] = "no matches";
+    const auto none = ok(restarted.handle(empty, true));
+    check(none["total"] == 0 && none["items"].empty(), "unmatched location query returned entries");
+    empty["query"] = " ";
+    fails(restarted.handle(empty, true), "empty_field");
+    ok(restarted.handle({{"op", "note.delete"}, {"id", note["id"]}}));
+    fails(restarted.handle(command, true), "not_found");
+}
 } // namespace
 
 int main() {
@@ -1074,7 +1113,8 @@ int main() {
         {"message edits preserve append identity", message_edits_keep_identity_and_append_retries},
         {"message edit concurrency, validation, and rollback", message_edit_conflicts_validation_and_rollback},
         {"note search Unicode, paging, and stable locations", note_search_unicode_paging_and_locations},
-        {"note search bounds and edited content", note_search_bounds_and_current_content}
+        {"note search bounds and edited content", note_search_bounds_and_current_content},
+        {"complete GUI-only in-note search locations", note_search_locations_are_trusted_and_complete}
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {
