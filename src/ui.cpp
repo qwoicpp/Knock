@@ -239,6 +239,7 @@ private:
     struct Banner { std::string id; std::wstring title; std::wstring text; bool inbox = false; };
     struct NoteRow { std::size_t index; int top; int height; int text_height; };
     struct NoteDraft { std::string text; std::vector<std::string> images; std::string client_id; };
+    struct NoteEdit { std::string message_id; std::int64_t revision = 0; NoteDraft draft; };
     struct MenuItem {
         UINT id;
         std::wstring label;
@@ -311,6 +312,7 @@ private:
     bool note_metadata_open_ = false;
     bool note_draft_dirty_ = false;
     NoteDraft note_draft_;
+    std::optional<NoteEdit> note_edit_;
     Json note_record_ = Json::object();
     Json note_messages_ = Json::array();
     std::size_t note_offset_ = 0;
@@ -962,6 +964,7 @@ private:
         }
         detail_dirty_ = false;
         note_metadata_open_ = false;
+        note_edit_.reset();
         note_rows_.clear();
         note_image_cache_.clear();
         KillTimer(window_, 4);
@@ -983,7 +986,7 @@ private:
             load_note_draft();
             populating_ = true;
             composer_edit_ = make_edit(content_, 37, true, L"Write something, or paste an image...");
-            SetWindowTextW(composer_edit_, widen(note_draft_.text).c_str());
+            SetWindowTextW(composer_edit_, widen(composer_draft().text).c_str());
             populating_ = false;
             layout();
             scroll_note_to_end();
@@ -1251,6 +1254,13 @@ private:
         SetFocus(note_query_edit_);
     }
     bool note_keys(HWND target, WPARAM key) {
+        if (!settings_open_ && detail_ == Detail::note && !note_metadata_open_ && !tag_picker_open_ &&
+            target == composer_edit_ && key == VK_UP && GetKeyState(VK_CONTROL) >= 0 &&
+            GetKeyState(VK_SHIFT) >= 0 && GetKeyState(VK_MENU) >= 0 && !note_edit_ &&
+            edit_text(composer_edit_).empty() && note_draft_.images.empty() && !note_messages_.empty()) {
+            begin_note_message_edit(note_messages_.back());
+            return true;
+        }
         if (target == footer_edit_ && !note_command_choices_.empty() && (key == VK_UP || key == VK_DOWN)) {
             if (key == VK_UP) note_command_selection_ = (note_command_selection_ + note_command_choices_.size() - 1) % note_command_choices_.size();
             else note_command_selection_ = (note_command_selection_ + 1) % note_command_choices_.size();
@@ -1444,8 +1454,11 @@ private:
     std::filesystem::path note_draft_path() const {
         return data_directory() / L"drafts" / (detail_id_ + ".conversation.json");
     }
+    NoteDraft& composer_draft() { return note_edit_ ? note_edit_->draft : note_draft_; }
+    const NoteDraft& composer_draft() const { return note_edit_ ? note_edit_->draft : note_draft_; }
     void load_note_draft() {
         note_draft_ = {};
+        note_edit_.reset();
         note_draft_dirty_ = false;
         auto path = note_draft_path();
         if (!std::filesystem::exists(path)) return;
@@ -1460,14 +1473,38 @@ private:
                 std::any_of(images.begin(), images.end(), [](const auto& name) { return !valid_note_image_name(name); }))
                 throw std::runtime_error("Invalid note draft");
             note_draft_ = {std::move(value), std::move(images), saved.value("client_id", std::string())};
+            if (saved.contains("edit")) {
+                const auto& edit = saved.at("edit");
+                auto id = edit.at("message_id").get<std::string>();
+                auto text = edit.at("text").get<std::string>();
+                auto attachments = edit.at("images").get<std::vector<std::string>>();
+                const auto revision = edit.at("revision").get<std::int64_t>();
+                if (id.empty() || id.size() > 128 || text.size() > 256 * 1024 || revision < 0 ||
+                    attachments.size() > 8 || std::any_of(attachments.begin(), attachments.end(),
+                        [](const auto& name) { return !valid_note_image_name(name); }))
+                    throw std::runtime_error("Invalid entry edit draft");
+                note_edit_ = NoteEdit{std::move(id), revision, {std::move(text), std::move(attachments), {}}};
+                const auto current = store_.handle({{"op", "note.message.get"}, {"id", detail_id_},
+                    {"message_id", note_edit_->message_id}});
+                if (current.value("ok", false)) {
+                    const auto& entry = current.at("message");
+                    // The edit may have committed before its draft was cleared.
+                    if (entry.value("revision", std::int64_t(0)) > revision &&
+                        get_string(entry, "text") == note_edit_->draft.text &&
+                        entry.at("images") == Json(note_edit_->draft.images)) {
+                        note_edit_.reset();
+                        note_draft_dirty_ = true;
+                    }
+                } else feedback(L"This entry was removed. Your edit is kept in the composer.");
+            }
             if (!note_draft_.client_id.empty()) {
                 auto result = mutate({{"op", "note.find_message"}, {"id", detail_id_}, {"client_id", note_draft_.client_id}});
                 if (result.value("ok", false) && !result.at("message").is_null()) {
                     note_draft_ = {};
                     note_draft_dirty_ = true;
-                    save_note_draft();
                 }
             }
+            if (note_draft_dirty_) save_note_draft();
         } catch (const std::exception&) {
             auto preserved = path;
             preserved += ".unreadable." + std::to_string(now_ms());
@@ -1477,20 +1514,24 @@ private:
     }
     bool save_note_draft() {
         if (detail_ != Detail::note || !note_draft_dirty_) return true;
-        if (composer_edit_) note_draft_.text = narrow(edit_text(composer_edit_));
+        if (composer_edit_) composer_draft().text = narrow(edit_text(composer_edit_));
         try {
             auto path = note_draft_path();
             std::filesystem::create_directories(path.parent_path());
-            if (note_draft_.text.empty() && note_draft_.images.empty()) {
+            if (note_draft_.text.empty() && note_draft_.images.empty() && !note_edit_) {
                 std::filesystem::remove(path);
             } else {
                 auto temporary = path;
                 temporary += ".tmp";
                 {
                     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-                    output << Json{{"note_id", detail_id_}, {"title", detail_original_title_},
-                                   {"text", note_draft_.text}, {"images", note_draft_.images},
-                                   {"client_id", note_draft_.client_id}}.dump(2);
+                    Json draft{{"note_id", detail_id_}, {"title", detail_original_title_},
+                               {"text", note_draft_.text}, {"images", note_draft_.images},
+                               {"client_id", note_draft_.client_id}};
+                    if (note_edit_) draft["edit"] = {{"message_id", note_edit_->message_id},
+                        {"revision", note_edit_->revision}, {"text", note_edit_->draft.text},
+                        {"images", note_edit_->draft.images}};
+                    output << draft.dump(2);
                     output.flush();
                     if (!output) throw std::runtime_error("Could not write the note draft");
                 }
@@ -1573,17 +1614,78 @@ private:
         layout();
         SetFocus(title_edit_);
     }
+    void begin_note_message_edit(const Json& entry) {
+        if (note_edit_) {
+            feedback(L"Save or cancel the current entry edit first.");
+            SetFocus(composer_edit_);
+            return;
+        }
+        if (!save_note_draft()) return;
+        note_edit_ = NoteEdit{get_string(entry, "id"), entry.value("revision", std::int64_t(0)),
+            {get_string(entry, "text"), entry.at("images").get<std::vector<std::string>>(), {}}};
+        populating_ = true;
+        SetWindowTextW(composer_edit_, widen(note_edit_->draft.text).c_str());
+        populating_ = false;
+        note_draft_dirty_ = true;
+        save_note_draft();
+        layout();
+        SetFocus(composer_edit_);
+        SendMessageW(composer_edit_, EM_SETSEL, -1, -1);
+    }
+    void cancel_note_message_edit() {
+        if (!note_edit_) return;
+        note_edit_->draft.text = narrow(edit_text(composer_edit_));
+        const auto previous = note_edit_;
+        note_edit_.reset();
+        populating_ = true;
+        SetWindowTextW(composer_edit_, widen(note_draft_.text).c_str());
+        populating_ = false;
+        note_draft_dirty_ = true;
+        if (!save_note_draft()) {
+            note_edit_ = previous;
+            populating_ = true;
+            SetWindowTextW(composer_edit_, widen(note_edit_->draft.text).c_str());
+            populating_ = false;
+        } else load_note_history();
+        layout();
+        SetFocus(composer_edit_);
+    }
+    void save_note_message_edit() {
+        if (!note_edit_) return;
+        note_draft_dirty_ = true;
+        if (!save_note_draft()) return;
+        auto result = store_.handle({{"op", "note.message.edit"}, {"id", detail_id_},
+            {"message_id", note_edit_->message_id}, {"expected_revision", note_edit_->revision},
+            {"text", note_edit_->draft.text}, {"images", note_edit_->draft.images}}, true);
+        if (!result.value("ok", false)) {
+            const auto error = get_string(result, "error");
+            feedback(error == "message_edit_conflict" ?
+                L"This entry changed elsewhere. Your edit is kept; cancel to reload the latest version." : widen(error));
+            return;
+        }
+        note_edit_.reset();
+        populating_ = true;
+        SetWindowTextW(composer_edit_, widen(note_draft_.text).c_str());
+        populating_ = false;
+        note_draft_dirty_ = true;
+        save_note_draft();
+        load_note_history();
+        layout();
+        feedback(L"Entry updated.");
+        SetFocus(composer_edit_);
+    }
     bool paste_note_attachment() {
         auto pasted = paste_note_image(window_, data_directory());
         if (pasted.status == ClipboardImageStatus::no_image) return false;
         if (pasted.status == ClipboardImageStatus::error) { feedback(pasted.error); return true; }
-        if (note_draft_.images.size() >= 8) {
+        auto& draft = composer_draft();
+        if (draft.images.size() >= 8) {
             remove_note_image(data_directory(), pasted.filename);
             feedback(L"You can add up to eight images to one entry.");
             return true;
         }
-        note_draft_.images.push_back(std::move(pasted.filename));
-        note_draft_.client_id.clear();
+        draft.images.push_back(std::move(pasted.filename));
+        draft.client_id.clear();
         note_draft_dirty_ = true;
         save_note_draft();
         layout();
@@ -1591,11 +1693,12 @@ private:
         return true;
     }
     void remove_pending_image(const std::string& filename) {
-        auto previous = note_draft_.images;
-        std::erase(note_draft_.images, filename);
-        note_draft_.client_id.clear();
+        auto& draft = composer_draft();
+        auto previous = draft.images;
+        std::erase(draft.images, filename);
+        draft.client_id.clear();
         note_draft_dirty_ = true;
-        if (!save_note_draft()) { note_draft_.images = std::move(previous); return; }
+        if (!save_note_draft()) { draft.images = std::move(previous); return; }
         // Keep imported files when detaching them. An earlier successful send
         // may still reference one after a failed draft cleanup or crash.
         note_image_cache_.erase(filename);
@@ -1604,6 +1707,7 @@ private:
     }
     void send_note_message() {
         if (!composer_edit_ || detail_ != Detail::note || tag_picker_open_ || note_metadata_open_) return;
+        if (note_edit_) { save_note_message_edit(); return; }
         auto value = narrow(edit_text(composer_edit_));
         if (trim(value).empty() && note_draft_.images.empty()) { SetFocus(composer_edit_); return; }
         if (note_draft_.client_id.empty()) note_draft_.client_id = send_token();
@@ -1622,7 +1726,8 @@ private:
         SetFocus(composer_edit_);
     }
     void cache_note_images() {
-        std::set<std::string> visible(note_draft_.images.begin(), note_draft_.images.end());
+        const auto& images = composer_draft().images;
+        std::set<std::string> visible(images.begin(), images.end());
         const int height = note_history_bounds_.bottom - note_history_bounds_.top;
         for (const auto& row : note_rows_) {
             if (row.top + row.height < note_scroll_ || row.top > note_scroll_ + height) continue;
@@ -1705,6 +1810,7 @@ private:
                     filename = note_image_at(local.x, local.y);
                     items.push_back({0, L"", false, true});
                     items.push_back({20, L"Copy entry", !get_string(entry, "text").empty()});
+                    items.push_back({23, L"Edit entry", !note_edit_});
                     if (!filename.empty()) items.push_back({21, L"Open image"});
                     items.push_back({22, L"Delete entry"});
                 }
@@ -1721,6 +1827,7 @@ private:
         }
         if (selected == 20) { copy(get_string(entry, "text")); feedback(L"Entry copied."); }
         if (selected == 21) open_note_image(filename);
+        if (selected == 23) begin_note_message_edit(entry);
         if (selected == 22) {
             const bool previous_menu = context_menu_;
             context_menu_ = true;
@@ -2275,17 +2382,23 @@ private:
                    [this] { if (save_detail()) { open_note_metadata(); feedback(L"Note details saved."); } });
             return;
         }
-        const int attachments = note_draft_.images.empty() ? 0 : px(55);
+        const auto& composer_images = composer_draft().images;
+        const int attachments = composer_images.empty() ? 0 : px(55);
         note_history_bounds_ = RECT{0, px(35), area.right, std::max(px(88), static_cast<int>(area.bottom) - px(94) - attachments)};
         note_composer_bounds_ = RECT{0, note_history_bounds_.bottom + px(8) + attachments, area.right, area.bottom - px(29)};
         note_attachment_bounds_ = RECT{0, note_history_bounds_.bottom + px(8), area.right, note_history_bounds_.bottom + px(55)};
         MoveWindow(composer_edit_, px(5), note_composer_bounds_.top + px(5), area.right - px(16),
                    std::max(px(25), static_cast<int>(note_composer_bounds_.bottom - note_composer_bounds_.top) - px(10)), FALSE);
-        button("note-send", content_, L"SEND", rect(area.right - px(62), area.bottom - px(23), px(62), px(22)),
+        const int send_width = note_edit_ ? px(88) : px(62);
+        button("note-send", content_, note_edit_ ? L"SAVE EDIT" : L"SEND",
+               rect(area.right - send_width, area.bottom - px(23), send_width, px(22)),
                [this] { send_note_message(); });
+        if (note_edit_)
+            button("note-edit-cancel", content_, L"CANCEL", rect(area.right - send_width - px(74), area.bottom - px(23), px(66), px(22)),
+                   [this] { cancel_note_message_edit(); });
         int attachment_width = std::min(px(45), static_cast<int>(area.right) / 8);
-        for (std::size_t i = 0; i < note_draft_.images.size(); ++i) {
-            const auto name = note_draft_.images[i];
+        for (std::size_t i = 0; i < composer_images.size(); ++i) {
+            const auto name = composer_images[i];
             int left = static_cast<int>(i) * (attachment_width + px(3));
             button("attachment-remove:" + name, content_, L"x", rect(left + attachment_width - px(13), note_attachment_bounds_.top, px(13), px(14)),
                    [this, name] { remove_pending_image(name); });
@@ -2620,7 +2733,8 @@ private:
             if (y + row.height < note_history_bounds_.top || y > note_history_bounds_.bottom) continue;
             const auto& entry = note_messages_[row.index];
             text(dc, L">", rect(px(8), y, px(12), px(16)), body_font_, orange, DT_SINGLELINE);
-            text(dc, L"me", rect(px(25), y, px(45), px(16)), small_font_, muted, DT_SINGLELINE | DT_VCENTER);
+            text(dc, entry.contains("edited_at") ? L"me · edited" : L"me",
+                 rect(px(25), y, px(105), px(16)), small_font_, muted, DT_SINGLELINE | DT_VCENTER);
             text(dc, display_time(entry.value("created_at", std::int64_t(0))),
                  RECT{area.right - px(110), y, area.right - px(12), y + px(16)}, small_font_, subdued,
                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
@@ -2640,16 +2754,17 @@ private:
         RestoreDC(dc, saved);
         outline(dc, note_composer_bounds_, border);
         draw_editor_scroll(dc, composer_edit_);
-        if (!note_draft_.images.empty()) {
+        const auto& images = composer_draft().images;
+        if (!images.empty()) {
             int attachment_width = std::min(px(45), static_cast<int>(area.right) / 8);
-            for (std::size_t i = 0; i < note_draft_.images.size(); ++i) {
+            for (std::size_t i = 0; i < images.size(); ++i) {
                 int left = static_cast<int>(i) * (attachment_width + px(3));
-                draw_note_image(dc, note_draft_.images[i], RECT{left, note_attachment_bounds_.top,
+                draw_note_image(dc, images[i], RECT{left, note_attachment_bounds_.top,
                     left + attachment_width, note_attachment_bounds_.top + px(42)});
             }
         }
-        text(dc, L"Enter to add  /  Shift+Enter for a new line",
-             RECT{0, area.bottom - px(22), area.right - px(73), area.bottom - px(1)}, small_font_, subdued,
+        text(dc, note_edit_ ? L"Editing entry" : L"Enter to add  /  Shift+Enter for a new line",
+             RECT{0, area.bottom - px(22), area.right - px(note_edit_ ? 174 : 73), area.bottom - px(1)}, small_font_, subdued,
              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     void draw_notifications(HDC dc, RECT area) {
@@ -2749,6 +2864,7 @@ private:
         if (settings_open_) settings_back();
         else if (tag_picker_open_) close_tag_picker();
         else if (detail_ == Detail::note && note_metadata_open_) open_note_metadata();
+        else if (detail_ == Detail::note && note_edit_) cancel_note_message_edit();
         else if (reply_edit_ && tab_ == Tab::notifications) cancel_reply();
         else if (detail_ != Detail::none) leave_detail();
         else if (note_page_visible()) close_note_page();
@@ -2824,7 +2940,7 @@ private:
             layout();
         }
         if (event == EN_CHANGE && !populating_ && id == 37 && detail_ == Detail::note) {
-            note_draft_.client_id.clear();
+            composer_draft().client_id.clear();
             note_draft_dirty_ = true;
             SetTimer(window_, 4, 600, nullptr);
         }
