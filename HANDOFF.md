@@ -10,6 +10,12 @@ Version 0.6.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
 `knock.exe`, and the `assets` directory together. There is no web runtime,
 server account, or network listener.
 
+The [v0.6.0 release](https://github.com/qwoicpp/Knock/releases/tag/v0.6.0) is
+published with `Knock-0.6.0-Windows-x64.zip`. The portable archive contains both
+ready-built executables, the original image assets, documentation, and dependency
+notices. Extract the complete archive and launch `KnockTray.exe`; no build step
+is required. Saved data remains under `%LOCALAPPDATA%\Knock`.
+
 - C++20, Win32/GDI/GDI+, per-account/session named pipe, durable JSON store.
 - UI reference: default 420 × 510 logical pixels, #090909 background, #151515
   tabs, #474747 borders, light monospace text, bundled pixel art. Settings

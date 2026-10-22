@@ -14,6 +14,13 @@ want to keep together.
 This started as a side tool for my own projects. Putting it here because why
 not. I'll keep changing it as I use it.
 
+## Download
+
+[Download for Windows (x64)](https://github.com/qwoicpp/Knock/releases/latest)
+
+The ZIP includes the ready-built app and CLI. Extract the whole thing and run
+**KnockTray.exe**.
+
 ## What it looks like
 
 ![The request inbox with Away status](docs/screenshots/presence-inbox.png)
