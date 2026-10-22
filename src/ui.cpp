@@ -3,6 +3,7 @@
 #include "knock/sprite.hpp"
 #include "knock/hotkey.hpp"
 #include "knock/note_images.hpp"
+#include "knock/window_settings.hpp"
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -135,6 +136,7 @@ public:
 
     int run(bool show_on_start) {
         store_.load();
+        const bool settings_loaded = window_settings_.initialize();
         recover_completions();
         snapshot_ = store_.snapshot();
         WNDCLASSEXW wc{};
@@ -177,6 +179,7 @@ public:
             if (PostMessageW(window_, change_message, 0, reinterpret_cast<LPARAM>(owned.get()))) owned.release();
         });
         server_.start();
+        if (!settings_loaded) feedback(window_settings_.error());
         if (!hotkey_.initialize(window_)) feedback(hotkey_.error());
         SetTimer(window_, 1, 1000, nullptr);
         layout();
@@ -187,6 +190,10 @@ public:
                 if (message.wParam == VK_ESCAPE) { escape(); continue; }
                 if (message.wParam == VK_RETURN && message.hwnd == footer_edit_) { add_item(); continue; }
                 if (message.wParam == VK_RETURN && message.hwnd == tag_query_edit_) { activate_tag_query(); continue; }
+                if (message.wParam == VK_RETURN && settings_open_ &&
+                    (message.hwnd == settings_width_edit_ || message.hwnd == settings_height_edit_)) {
+                    apply_window_size(); continue;
+                }
                 if (message.hwnd == composer_edit_ &&
                     ((message.wParam == 'V' && GetKeyState(VK_CONTROL) < 0) ||
                      (message.wParam == VK_INSERT && GetKeyState(VK_SHIFT) < 0))) {
@@ -229,11 +236,18 @@ private:
     struct Banner { std::string id; std::wstring title; std::wstring text; };
     struct NoteRow { std::size_t index; int top; int height; int text_height; };
     struct NoteDraft { std::string text; std::vector<std::string> images; std::string client_id; };
+    struct MenuItem {
+        UINT id;
+        std::wstring label;
+        bool enabled = true;
+        bool separator = false;
+    };
 
     HINSTANCE instance_;
     Store store_;
     PipeServer server_;
     HotkeyManager hotkey_{data_directory()};
+    WindowSettings window_settings_{data_directory()};
     HWND window_ = nullptr;
     HWND content_ = nullptr;
     HICON icon_ = nullptr;
@@ -258,6 +272,10 @@ private:
     bool context_menu_ = false;
     bool quitting_ = false;
     bool keep_open_ = false;
+    bool settings_open_ = false;
+    HWND settings_return_focus_ = nullptr;
+    HWND settings_width_edit_ = nullptr;
+    HWND settings_height_edit_ = nullptr;
     HWND footer_edit_ = nullptr;
     HWND title_edit_ = nullptr;
     HWND body_edit_ = nullptr;
@@ -328,7 +346,8 @@ private:
         body_font_ = make(12, FW_NORMAL);
         small_font_ = make(10, FW_NORMAL);
         title_font_ = make(13, FW_NORMAL);
-        for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_})
+        for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_,
+                          settings_width_edit_, settings_height_edit_})
             if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), TRUE);
     }
     void text(HDC dc, const std::wstring& value, RECT bounds, HFONT font,
@@ -430,16 +449,7 @@ private:
         banners_.push_back(std::move(banner));
         if (!active_banner_) next_banner();
     }
-    void show(const std::string& focus_id = {}, bool pinned = false) {
-        if (!IsWindowVisible(window_)) keep_open_ = pinned;
-        else if (pinned) keep_open_ = true;
-        recover_completions();
-        if (!focus_id.empty()) {
-            if (!save_detail()) return;
-            detail_ = Detail::none;
-            destroy_detail_edits();
-            tab_ = Tab::notifications;
-        }
+    void position_popup() {
         POINT cursor{};
         GetCursorPos(&cursor);
         NOTIFYICONIDENTIFIER identifier{};
@@ -453,13 +463,26 @@ private:
         MONITORINFO info{};
         info.cbSize = sizeof(info);
         GetMonitorInfoW(monitor, &info);
-        int width = std::min(px(420), static_cast<int>(info.rcWork.right - info.rcWork.left) - px(16));
-        int height = std::min(px(510), static_cast<int>(info.rcWork.bottom - info.rcWork.top) - px(16));
+        int width = std::min(px(window_settings_.size().width), static_cast<int>(info.rcWork.right - info.rcWork.left) - px(16));
+        int height = std::min(px(window_settings_.size().height), static_cast<int>(info.rcWork.bottom - info.rcWork.top) - px(16));
         int x = info.rcWork.right - width - px(8);
         int y = info.rcWork.bottom - height - px(8);
         if (has_tray && tray.top < info.rcWork.top) y = info.rcWork.top + px(8);
         if (has_tray && tray.right <= info.rcWork.left) x = info.rcWork.left + px(8);
         SetWindowPos(window_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+    }
+    void show(const std::string& focus_id = {}, bool pinned = false) {
+        if (!IsWindowVisible(window_)) keep_open_ = pinned;
+        else if (pinned) keep_open_ = true;
+        recover_completions();
+        if (!focus_id.empty()) {
+            if (settings_open_) close_settings();
+            if (!save_detail()) return;
+            detail_ = Detail::none;
+            destroy_detail_edits();
+            tab_ = Tab::notifications;
+        }
+        position_popup();
         layout();
         if (!focus_id.empty()) {
             auto found = row_tops_.find(focus_id);
@@ -474,7 +497,7 @@ private:
         InvalidateRect(content_, nullptr, FALSE);
     }
     void update_animation() {
-        if (IsWindowVisible(window_) && tab_ == Tab::notifications && detail_ == Detail::none) {
+        if (IsWindowVisible(window_) && !settings_open_ && tab_ == Tab::notifications && detail_ == Detail::none) {
             request_sprite_.resume(); complete_sprite_.resume(); note_sprite_.resume();
             if (request_sprite_.animated() || complete_sprite_.animated() || note_sprite_.animated())
                 SetTimer(window_, 2, 50, nullptr);
@@ -513,34 +536,80 @@ private:
         RegCloseKey(key);
         if (result != ERROR_SUCCESS) feedback(L"Could not update startup setting.");
     }
-    void context_menu() {
-        context_menu_ = true;
+    int popup_menu(POINT point, const std::vector<MenuItem>& items) {
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, 1, L"Open Knock");
-        AppendMenuW(menu, MF_STRING | (startup_enabled() ? MF_CHECKED : 0), 2, L"Start with Windows");
-        AppendMenuW(menu, MF_STRING, 3, L"Open data folder");
-        auto shortcut = L"Shortcut... (" + hotkey_.label() + L")";
-        AppendMenuW(menu, MF_STRING, 5, shortcut.c_str());
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 4, L"Quit");
-        POINT point{};
-        GetCursorPos(&point);
+        if (!menu) return 0;
+        MENUINFO appearance{};
+        appearance.cbSize = sizeof(appearance);
+        appearance.fMask = MIM_BACKGROUND;
+        appearance.hbrBack = edit_brush_;
+        SetMenuInfo(menu, &appearance);
+        for (const auto& item : items) {
+            MENUITEMINFOW info{};
+            info.cbSize = sizeof(info);
+            info.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE;
+            info.fType = MFT_OWNERDRAW | (item.separator ? MFT_SEPARATOR : 0);
+            info.fState = item.enabled && !item.separator ? MFS_ENABLED : MFS_DISABLED;
+            info.wID = item.id;
+            info.dwItemData = reinterpret_cast<ULONG_PTR>(&item);
+            if (!item.separator) {
+                info.fMask |= MIIM_STRING;
+                info.dwTypeData = const_cast<wchar_t*>(item.label.c_str());
+            }
+            InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &info);
+        }
+        const bool previous_menu = context_menu_;
+        context_menu_ = true;
         SetForegroundWindow(window_);
         int selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                                       point.x, point.y, 0, window_, nullptr);
         DestroyMenu(menu);
-        context_menu_ = false;
+        context_menu_ = previous_menu;
         PostMessageW(window_, WM_NULL, 0, 0);
-        if (selected == 1) show();
-        if (selected == 2) toggle_startup();
-        if (selected == 3) ShellExecuteW(window_, L"open", data_directory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        if (selected == 5) {
-            context_menu_ = true;
-            hotkey_.configure(window_);
-            context_menu_ = false;
-            if (!hotkey_.error().empty()) feedback(hotkey_.error());
+        return selected;
+    }
+    void measure_menu(MEASUREITEMSTRUCT& measure) {
+        const auto* item = reinterpret_cast<const MenuItem*>(measure.itemData);
+        if (!item) return;
+        HDC dc = GetDC(window_);
+        auto previous = SelectObject(dc, body_font_);
+        SIZE size{};
+        GetTextExtentPoint32W(dc, item->label.c_str(), static_cast<int>(item->label.size()), &size);
+        SelectObject(dc, previous);
+        ReleaseDC(window_, dc);
+        measure.itemWidth = static_cast<UINT>(std::max(px(142), static_cast<int>(size.cx) + px(24)));
+        measure.itemHeight = static_cast<UINT>(px(item->separator ? 7 : 26));
+    }
+    void draw_menu(const DRAWITEMSTRUCT& draw) {
+        const auto* item = reinterpret_cast<const MenuItem*>(draw.itemData);
+        if (!item) return;
+        RECT bounds = draw.rcItem;
+        fill(draw.hDC, bounds, draw.itemState & ODS_SELECTED ? RGB(35, 35, 35) : background);
+        if (item->separator) {
+            fill(draw.hDC, RECT{bounds.left + px(7), (bounds.top + bounds.bottom) / 2,
+                 bounds.right - px(7), (bounds.top + bounds.bottom) / 2 + 1}, border);
+            return;
         }
-        if (selected == 4 && save_detail()) {
+        bounds.left += px(10);
+        bounds.right -= px(10);
+        text(draw.hDC, item->label, bounds, body_font_, item->enabled ? foreground : subdued,
+             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    }
+    void context_menu() {
+        POINT point{};
+        GetCursorPos(&point);
+        const std::vector<MenuItem> items{
+            {1, L"Open Knock"}, {2, L"Settings..."},
+            {3, startup_enabled() ? L"[x] Start with Windows" : L"[ ] Start with Windows"},
+            {4, L"Open data folder"}, {0, L"", false, true}, {5, L"Quit"}
+        };
+        int selected = popup_menu(point, items);
+        if (selected == 1) show();
+        if (selected == 2) { show(); open_settings(); }
+        if (selected == 3) { toggle_startup(); layout(); }
+        if (selected == 4) ShellExecuteW(window_, L"open", data_directory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (selected == 5 && settings_open_) close_settings();
+        if (selected == 5 && save_detail()) {
             quitting_ = true;
             DestroyWindow(window_);
             return;
@@ -550,6 +619,63 @@ private:
         data.hWnd = window_;
         data.uID = 1;
         Shell_NotifyIconW(NIM_SETFOCUS, &data);
+    }
+    void open_settings() {
+        if (settings_open_) return;
+        if (!save_detail(SaveIntent::background)) return;
+        settings_return_focus_ = GetFocus();
+        settings_open_ = true;
+        settings_width_edit_ = make_edit(content_, 41, false, L"Width");
+        settings_height_edit_ = make_edit(content_, 42, false, L"Height");
+        for (HWND edit : {settings_width_edit_, settings_height_edit_}) {
+            SetWindowLongPtrW(edit, GWL_STYLE, GetWindowLongPtrW(edit, GWL_STYLE) | ES_NUMBER);
+            SendMessageW(edit, EM_SETLIMITTEXT, 4, 0);
+        }
+        SetWindowTextW(settings_width_edit_, std::to_wstring(window_settings_.size().width).c_str());
+        SetWindowTextW(settings_height_edit_, std::to_wstring(window_settings_.size().height).c_str());
+        feedback_.clear();
+        layout();
+        SetFocus(settings_width_edit_);
+    }
+    void close_settings() {
+        if (!settings_open_) return;
+        for (HWND* edit : {&settings_width_edit_, &settings_height_edit_}) {
+            if (*edit) DestroyWindow(*edit);
+            *edit = nullptr;
+        }
+        settings_open_ = false;
+        feedback_.clear();
+        layout();
+        SetFocus(IsWindow(settings_return_focus_) && IsWindowVisible(settings_return_focus_)
+            ? settings_return_focus_ : window_);
+        settings_return_focus_ = nullptr;
+    }
+    void configure_hotkey() {
+        const bool previous_menu = context_menu_;
+        context_menu_ = true;
+        hotkey_.configure(window_);
+        context_menu_ = previous_menu;
+        if (!hotkey_.error().empty()) feedback(hotkey_.error());
+        layout();
+    }
+    void apply_window_size() {
+        if (!settings_open_) return;
+        auto dimension = [](HWND edit) {
+            auto value = edit_text(edit);
+            if (value.empty() || value.size() > 4 ||
+                value.find_first_not_of(L"0123456789") != std::wstring::npos) return 0;
+            return std::stoi(value);
+        };
+        WindowSize size{dimension(settings_width_edit_), dimension(settings_height_edit_)};
+        if (!window_settings_.apply(size)) { feedback(window_settings_.error()); return; }
+        position_popup();
+        layout();
+        feedback(L"Window size saved.");
+    }
+    void reset_window_size() {
+        SetWindowTextW(settings_width_edit_, L"420");
+        SetWindowTextW(settings_height_edit_, L"510");
+        apply_window_size();
     }
 
     HWND make_edit(HWND parent, int id, bool multiline, const wchar_t* cue) {
@@ -665,6 +791,7 @@ private:
         }
     }
     void switch_tab(Tab next) {
+        if (settings_open_) close_settings();
         if (next == tab_ && detail_ == Detail::none) return;
         if (!save_detail()) return;
         detail_ = Detail::none;
@@ -1080,31 +1207,69 @@ private:
         }
         return {};
     }
-    void note_message_menu(int x, int y) {
-        if (y < note_history_bounds_.top || y >= note_history_bounds_.bottom) return;
-        const int position = y - note_history_bounds_.top + note_scroll_;
-        auto found = std::find_if(note_rows_.begin(), note_rows_.end(), [&](const auto& row) {
-            return position >= row.top && position < row.top + row.height;
-        });
-        if (found == note_rows_.end()) return;
-        const auto entry = note_messages_[found->index];
-        const auto filename = note_image_at(x, y);
-        context_menu_ = true;
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | (get_string(entry, "text").empty() ? MF_GRAYED : 0), 1, L"Copy entry");
-        if (!filename.empty()) AppendMenuW(menu, MF_STRING, 2, L"Open image");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 3, L"Delete entry");
-        POINT point{x, y}; ClientToScreen(content_, &point);
-        auto selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-                                      point.x, point.y, 0, window_, nullptr);
-        DestroyMenu(menu);
-        if (selected == 1) { copy(get_string(entry, "text")); feedback(L"Entry copied."); }
-        if (selected == 2) open_note_image(filename);
-        if (selected == 3 && MessageBoxW(window_, L"Delete this entry?", L"Knock", MB_YESNO | MB_DEFBUTTON2) == IDYES) {
-            mutate({{"op", "note.message.remove"}, {"id", detail_id_}, {"message_id", entry.at("id")}});
+    void app_context_menu(HWND source, LPARAM position) {
+        POINT point{GET_X_LPARAM(position), GET_Y_LPARAM(position)};
+        if (point.x == -1 && point.y == -1) {
+            RECT bounds{};
+            GetWindowRect(source, &bounds);
+            point = POINT{bounds.left + px(12), bounds.top + px(12)};
         }
-        context_menu_ = false;
+        std::vector<MenuItem> items{{1, L"Settings...", !settings_open_}, {2, L"Hide Knock"}};
+        wchar_t class_name[16]{};
+        GetClassNameW(source, class_name, 16);
+        const bool editor = lstrcmpiW(class_name, L"Edit") == 0;
+        Json entry;
+        std::string filename;
+        const auto note_id = detail_id_;
+        if (editor) {
+            DWORD first = 0, last = 0;
+            SendMessageW(source, EM_GETSEL, reinterpret_cast<WPARAM>(&first), reinterpret_cast<LPARAM>(&last));
+            const bool selection = first != last;
+            const bool paste = IsClipboardFormatAvailable(CF_UNICODETEXT) ||
+                (source == composer_edit_ && (IsClipboardFormatAvailable(CF_DIB) ||
+                  IsClipboardFormatAvailable(CF_DIBV5) || IsClipboardFormatAvailable(CF_BITMAP) ||
+                  IsClipboardFormatAvailable(CF_HDROP)));
+            items.insert(items.end(), {{0, L"", false, true},
+                {10, L"Undo", SendMessageW(source, EM_CANUNDO, 0, 0) != 0},
+                {11, L"Cut", selection}, {12, L"Copy", selection}, {13, L"Paste", paste},
+                {14, L"Select all", GetWindowTextLengthW(source) > 0}});
+        } else if (!settings_open_ && source == content_ && detail_ == Detail::note &&
+                   !tag_picker_open_ && !note_metadata_open_) {
+            POINT local = point;
+            ScreenToClient(content_, &local);
+            if (local.y >= note_history_bounds_.top && local.y < note_history_bounds_.bottom) {
+                const int y = local.y - note_history_bounds_.top + note_scroll_;
+                auto found = std::find_if(note_rows_.begin(), note_rows_.end(), [&](const auto& row) {
+                    return y >= row.top && y < row.top + row.height;
+                });
+                if (found != note_rows_.end()) {
+                    entry = note_messages_[found->index];
+                    filename = note_image_at(local.x, local.y);
+                    items.push_back({0, L"", false, true});
+                    items.push_back({20, L"Copy entry", !get_string(entry, "text").empty()});
+                    if (!filename.empty()) items.push_back({21, L"Open image"});
+                    items.push_back({22, L"Delete entry"});
+                }
+            }
+        }
+        const int selected = popup_menu(point, items);
+        if (selected == 1) open_settings();
+        if (selected == 2) hide();
+        if (selected >= 10 && selected <= 14 && IsWindow(source)) {
+            SetFocus(source);
+            const UINT commands[]{EM_UNDO, WM_CUT, WM_COPY, WM_PASTE, EM_SETSEL};
+            SendMessageW(source, commands[selected - 10], 0, selected == 14 ? -1 : 0);
+        }
+        if (selected == 20) { copy(get_string(entry, "text")); feedback(L"Entry copied."); }
+        if (selected == 21) open_note_image(filename);
+        if (selected == 22) {
+            const bool previous_menu = context_menu_;
+            context_menu_ = true;
+            const int answer = MessageBoxW(window_, L"Delete this entry?", L"Knock", MB_YESNO | MB_DEFBUTTON2);
+            context_menu_ = previous_menu;
+            if (answer == IDYES)
+                mutate({{"op", "note.message.remove"}, {"id", note_id}, {"message_id", entry.at("id")}});
+        }
     }
 
     void begin_reply(const std::string& id) {
@@ -1191,7 +1356,8 @@ private:
         model.tab = is_tab;
         model.active = active;
         model.card = !card.is_null();
-        model.left_aligned = key.starts_with("tag-choice:") || key == "tag-all" || key == "tag-untagged";
+        model.left_aligned = key.starts_with("tag-choice:") || key == "tag-all" || key == "tag-untagged" ||
+            key == "settings-startup";
         model.record = card;
         model.icon = icon;
         SetWindowTextW(model.handle, label.c_str());
@@ -1321,7 +1487,7 @@ private:
             int tab_width = MulDiv(widths[i], std::min(width - px(20), px(374)), 374);
             button("tab" + std::to_string(static_cast<int>(next)), window_, labels[i],
                 rect(tab_x, px(8), tab_width, px(26)), [this, next] { switch_tab(next); },
-                true, true, tab_ == next, Json(), icons[i]);
+                true, true, !settings_open_ && tab_ == next, Json(), icons[i]);
             tab_x += tab_width + px(4);
         }
         int top = px(44);
@@ -1332,9 +1498,9 @@ private:
             });
             top += px(28);
         }
-        bool footer = tab_ != Tab::notifications && detail_ == Detail::none;
+        bool footer = !settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none;
         notes_bar_y_ = 0;
-        if (tab_ == Tab::notes && detail_ == Detail::none) {
+        if (!settings_open_ && tab_ == Tab::notes && detail_ == Detail::none) {
             notes_bar_y_ = top;
             button("notes-filter", window_, L"FILTER", rect(px(12), top, px(64), px(22)),
                 [this] { open_tag_picker(); }, true, false, tag_picker_open_);
@@ -1353,16 +1519,61 @@ private:
             MoveWindow(footer_edit_, px(12), height - px(30), width - px(91), px(22), FALSE);
             ShowWindow(footer_edit_, SW_SHOW);
         } else if (footer_edit_) ShowWindow(footer_edit_, SW_HIDE);
-        if (detail_ != Detail::none) layout_detail(area);
+        if (settings_open_) {
+            for (HWND edit : {title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_,
+                              tag_query_edit_, composer_edit_}) if (edit) ShowWindow(edit, SW_HIDE);
+            layout_settings(area);
+        }
+        else if (detail_ != Detail::none) layout_detail(area);
         else if (tab_ == Tab::notifications) layout_notifications(area);
         else if (tag_picker_open_) { content_height_ = area.bottom; layout_tag_picker(area); }
         else layout_cards(area);
-        if (reply_edit_ && (tab_ != Tab::notifications || detail_ != Detail::none)) ShowWindow(reply_edit_, SW_HIDE);
+        if (reply_edit_ && (settings_open_ || tab_ != Tab::notifications || detail_ != Detail::none))
+            ShowWindow(reply_edit_, SW_HIDE);
         sweep_buttons();
         InvalidateRect(window_, nullptr, FALSE);
         InvalidateRect(content_, nullptr, FALSE);
         RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
         update_animation();
+    }
+    void layout_settings(RECT area) {
+        content_height_ = area.bottom;
+        button("settings-back", content_, L"< BACK", rect(0, px(2), px(68), px(22)), [this] { close_settings(); });
+        button("settings-hotkey", content_, L"CHANGE", rect(area.right - px(82), px(62), px(82), px(23)),
+               [this] { configure_hotkey(); });
+        const int field_width = (area.right - px(104)) / 2;
+        MoveWindow(settings_width_edit_, px(1), px(176), field_width - px(2), px(25), FALSE);
+        MoveWindow(settings_height_edit_, field_width + px(13), px(176), field_width - px(2), px(25), FALSE);
+        ShowWindow(settings_width_edit_, SW_SHOW);
+        ShowWindow(settings_height_edit_, SW_SHOW);
+        button("settings-apply", content_, L"APPLY", rect(area.right - px(82), px(176), px(82), px(25)),
+               [this] { apply_window_size(); });
+        button("settings-reset", content_, L"RESET", rect(area.right - px(82), px(210), px(82), px(23)),
+               [this] { reset_window_size(); });
+        button("settings-startup", content_, startup_enabled() ? L"[x] Start with Windows" : L"[ ] Start with Windows",
+               rect(0, px(252), area.right, px(23)), [this] { toggle_startup(); layout(); });
+    }
+    void draw_settings(HDC dc, RECT area) {
+        text(dc, L"SETTINGS", RECT{px(82), px(2), area.right, px(24)}, title_font_, foreground,
+             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        for (int y : {34, 126, 242}) fill(dc, RECT{0, px(y), area.right, px(y) + 1}, border);
+        text(dc, L"HOTKEY", RECT{0, px(43), area.right, px(60)}, small_font_, muted, DT_SINGLELINE | DT_NOPREFIX);
+        text(dc, hotkey_.label(), RECT{0, px(62), area.right - px(94), px(85)}, body_font_, foreground,
+             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (feedback_.empty() || GetTickCount64() >= feedback_until_)
+            text(dc, L"Hotkey stays open until toggled.", RECT{0, px(96), area.right, px(121)}, small_font_, subdued,
+                 DT_WORDBREAK | DT_NOPREFIX);
+        else text(dc, feedback_, RECT{0, px(91), area.right, px(123)}, small_font_, orange,
+                  DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+        text(dc, L"WINDOW SIZE", RECT{0, px(139), area.right, px(157)}, small_font_, muted, DT_SINGLELINE | DT_NOPREFIX);
+        const int field_width = (area.right - px(104)) / 2;
+        text(dc, L"WIDTH", RECT{0, px(160), field_width, px(175)}, small_font_, subdued, DT_SINGLELINE | DT_NOPREFIX);
+        text(dc, L"HEIGHT", RECT{field_width + px(12), px(160), area.right - px(92), px(175)}, small_font_, subdued,
+             DT_SINGLELINE | DT_NOPREFIX);
+        outline(dc, rect(0, px(175), field_width, px(28)), border);
+        outline(dc, rect(field_width + px(12), px(175), field_width, px(28)), border);
+        text(dc, L"360-800 x 360-1000", RECT{0, px(210), area.right - px(94), px(233)}, small_font_, subdued,
+             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     }
     void layout_detail(RECT area) {
         if (detail_ == Detail::note) { layout_note(area); return; }
@@ -1371,6 +1582,7 @@ private:
         button("delete", content_, L"DELETE", rect(area.right - px(72), px(2), px(72), px(22)), [this] { delete_detail(); });
         int title_y = px(39);
         MoveWindow(title_edit_, px(1), title_y, area.right - px(2), px(28), FALSE);
+        ShowWindow(title_edit_, SW_SHOW);
         int body_y = detail_ == Detail::note ? px(114) : px(81);
         note_body_y_ = body_y;
         int body_bottom = detail_ == Detail::task ? area.bottom - px(130) : area.bottom - px(39);
@@ -1385,6 +1597,8 @@ private:
             int half = (area.right - px(12)) / 2;
             MoveWindow(operator_edit_, 0, area.bottom - px(99), half, px(23), FALSE);
             MoveWindow(project_edit_, half + px(12), area.bottom - px(99), half, px(23), FALSE);
+            ShowWindow(operator_edit_, SW_SHOW);
+            ShowWindow(project_edit_, SW_SHOW);
             const char* values[] = {"todo", "in_progress", "done"};
             const wchar_t* labels[] = {L"TO DO", L"IN PROGRESS", L"DONE"};
             int button_width = (area.right - px(12)) / 3;
@@ -1567,7 +1781,7 @@ private:
                  RECT{area.right - px(75), notes_bar_y_, area.right - px(12), notes_bar_y_ + px(22)}, small_font_, subdued,
                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         }
-        if (tab_ != Tab::notifications && detail_ == Detail::none) {
+        if (!settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none) {
             fill(dc, RECT{px(12), area.bottom - px(43), area.right - px(12), area.bottom - px(43) + 1}, border);
             text(dc, L"Enter", RECT{area.right - px(67), area.bottom - px(30), area.right - px(15), area.bottom - px(8)},
                  small_font_, subdued, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1577,7 +1791,8 @@ private:
         RECT area{};
         GetClientRect(content_, &area);
         fill(dc, area, background);
-        if (detail_ != Detail::none) draw_detail(dc, area);
+        if (settings_open_) draw_settings(dc, area);
+        else if (detail_ != Detail::none) draw_detail(dc, area);
         else if (tab_ == Tab::notifications) draw_notifications(dc, area);
         else if (tag_picker_open_) draw_tag_picker(dc);
         else if ((tab_ == Tab::tasks && snapshot_["tasks"].empty()) || (tab_ == Tab::notes && !visible_note_count_)) {
@@ -1588,12 +1803,12 @@ private:
             text(dc, tab_ == Tab::tasks ? L"Add one below, or let an agent add it." : L"Give a note a name below and press Enter.",
                 RECT{px(7), px(49), area.right - px(7), px(95)}, body_font_, muted);
         }
-        if (detail_ == Detail::none && !tag_picker_open_ && content_height_ > area.bottom) {
+        if (!settings_open_ && detail_ == Detail::none && !tag_picker_open_ && content_height_ > area.bottom) {
             int thumb = std::max(px(24), static_cast<int>(area.bottom) * static_cast<int>(area.bottom) / content_height_);
             int top = (area.bottom - thumb) * scroll() / std::max(1, content_height_ - static_cast<int>(area.bottom));
             fill(dc, RECT{area.right - std::max(1, px(1)), top, area.right, top + thumb}, border);
         }
-        if (!feedback_.empty() && GetTickCount64() < feedback_until_) {
+        if (!settings_open_ && !feedback_.empty() && GetTickCount64() < feedback_until_) {
             RECT box{px(3), area.bottom - px(46), area.right - px(3), area.bottom - px(3)};
             if (detail_ == Detail::note && !note_metadata_open_ && !tag_picker_open_)
                 box = RECT{px(3), std::max(note_history_bounds_.top, note_history_bounds_.bottom - px(46)),
@@ -1803,7 +2018,7 @@ private:
         if (error) std::rethrow_exception(error);
     }
     void scroll_by(int amount) {
-        if (tag_picker_open_) return;
+        if (settings_open_ || tag_picker_open_) return;
         if (detail_ == Detail::note && !note_metadata_open_) {
             const int next = std::clamp(note_scroll_ + amount, 0, note_scroll_limit());
             if (next != note_scroll_) { note_scroll_ = next; layout(); }
@@ -1816,7 +2031,8 @@ private:
         layout();
     }
     void escape() {
-        if (tag_picker_open_) close_tag_picker();
+        if (settings_open_) close_settings();
+        else if (tag_picker_open_) close_tag_picker();
         else if (detail_ == Detail::note && note_metadata_open_) open_note_metadata();
         else if (reply_edit_ && tab_ == Tab::notifications) cancel_reply();
         else if (detail_ != Detail::none) leave_detail();
@@ -1900,7 +2116,17 @@ private:
     LRESULT message(HWND target, UINT message, WPARAM wparam, LPARAM lparam, bool content) {
         if (message == WM_PAINT) { paint(target, content); return 0; }
         if (message == WM_ERASEBKGND) return 1;
-        if (message == WM_DRAWITEM) { draw_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam)); return TRUE; }
+        if (message == WM_DRAWITEM) {
+            const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+            if (draw.CtlType == ODT_MENU) draw_menu(draw); else draw_button(draw);
+            return TRUE;
+        }
+        if (message == WM_MEASUREITEM && reinterpret_cast<MEASUREITEMSTRUCT*>(lparam)->CtlType == ODT_MENU) {
+            measure_menu(*reinterpret_cast<MEASUREITEMSTRUCT*>(lparam)); return TRUE;
+        }
+        if (message == WM_CONTEXTMENU) {
+            app_context_menu(wparam ? reinterpret_cast<HWND>(wparam) : target, lparam); return 0;
+        }
         if (message == WM_COMMAND) return command(wparam);
         if (message == WM_CTLCOLOREDIT || message == WM_CTLCOLORSTATIC || message == WM_CTLCOLORBTN) {
             HDC dc = reinterpret_cast<HDC>(wparam);
@@ -1909,6 +2135,7 @@ private:
             return reinterpret_cast<LRESULT>(edit_brush_);
         }
         if (message == WM_MOUSEWHEEL) {
+            if (settings_open_) return 0;
             wheel_remainder_ += GET_WHEEL_DELTA_WPARAM(wparam);
             int steps = wheel_remainder_ / WHEEL_DELTA;
             wheel_remainder_ %= WHEEL_DELTA;
@@ -1936,7 +2163,7 @@ private:
                         return 0;
                     }
                 }
-                if (detail_ == Detail::note && !tag_picker_open_ && !note_metadata_open_) {
+                if (!settings_open_ && detail_ == Detail::note && !tag_picker_open_ && !note_metadata_open_) {
                     const int x = GET_X_LPARAM(lparam), y = GET_Y_LPARAM(lparam);
                     if (x >= note_history_bounds_.right - px(10) && y >= note_history_bounds_.top &&
                         y < note_history_bounds_.bottom && note_scroll_limit()) {
@@ -1960,19 +2187,12 @@ private:
                 return 0;
             }
             if (message == WM_LBUTTONUP && dragging_note_scroll_) { dragging_note_scroll_ = false; ReleaseCapture(); return 0; }
-            if (message == WM_CONTEXTMENU && detail_ == Detail::note && !tag_picker_open_ && !note_metadata_open_) {
-                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                if (point.x == -1 && point.y == -1) GetCursorPos(&point);
-                ScreenToClient(content_, &point);
-                note_message_menu(point.x, point.y);
-                return 0;
-            }
             if (message == WM_CAPTURECHANGED) {
                 dragging_editor_ = nullptr;
                 dragging_scroll_ = false;
                 dragging_note_scroll_ = false;
             }
-            if (message == WM_LBUTTONDOWN && detail_ == Detail::none) {
+            if (message == WM_LBUTTONDOWN && !settings_open_ && detail_ == Detail::none) {
                 RECT area{}; GetClientRect(content_, &area);
                 if (GET_X_LPARAM(lparam) >= area.right - px(10) && content_height_ > viewport_height_) {
                     dragging_scroll_ = true;
@@ -2037,7 +2257,7 @@ private:
                 if (!feedback_.empty() && GetTickCount64() >= feedback_until_) {
                     feedback_.clear(); InvalidateRect(content_, nullptr, FALSE);
                 }
-            } else if (wparam == 2 && IsWindowVisible(window_) && tab_ == Tab::notifications) {
+            } else if (wparam == 2 && IsWindowVisible(window_) && !settings_open_ && tab_ == Tab::notifications) {
                 bool redraw = request_sprite_.advance();
                 redraw = complete_sprite_.advance() || redraw;
                 redraw = note_sprite_.advance() || redraw;
@@ -2089,6 +2309,7 @@ private:
     }
     static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data) {
         auto* app = reinterpret_cast<App*>(data);
+        if (message == WM_CONTEXTMENU) { app->app_context_menu(window, lparam); return 0; }
         if (message == WM_PASTE && window == app->composer_edit_ && app->paste_note_attachment()) return 0;
         if (message == WM_CHAR && wparam == 0x16 && window == app->composer_edit_) {
             SendMessageW(window, WM_PASTE, 0, 0); return 0;
@@ -2105,6 +2326,10 @@ private:
             }
             if (wparam == VK_RETURN && window == app->footer_edit_) { app->add_item(); return 0; }
             if (wparam == VK_RETURN && window == app->tag_query_edit_) { app->activate_tag_query(); return 0; }
+            if (wparam == VK_RETURN && app->settings_open_ &&
+                (window == app->settings_width_edit_ || window == app->settings_height_edit_)) {
+                app->apply_window_size(); return 0;
+            }
             if (wparam == VK_RETURN && window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0) {
                 app->send_note_message(); return 0;
             }
@@ -2114,12 +2339,14 @@ private:
             }
         }
         if (message == WM_CHAR && (wparam == VK_ESCAPE || (wparam == VK_RETURN &&
-            (window == app->footer_edit_ || window == app->tag_query_edit_ || GetKeyState(VK_CONTROL) < 0 ||
+            (window == app->footer_edit_ || window == app->tag_query_edit_ ||
+             window == app->settings_width_edit_ || window == app->settings_height_edit_ || GetKeyState(VK_CONTROL) < 0 ||
              (window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0))))) return 0;
         return DefSubclassProc(window, message, wparam, lparam);
     }
     static LRESULT CALLBACK button_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data) {
         auto* app = reinterpret_cast<App*>(data);
+        if (message == WM_CONTEXTMENU) { app->app_context_menu(window, lparam); return 0; }
         if (message == WM_ERASEBKGND) {
             RECT bounds{};
             GetClientRect(window, &bounds);
