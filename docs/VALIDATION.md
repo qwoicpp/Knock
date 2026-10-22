@@ -1,7 +1,7 @@
 # Validation
 
 The earlier sections retain the original platform and application checks.
-Version-specific additions follow; the latest results are in **Version 0.5**.
+Version-specific additions follow; the latest results are in **Version 0.6**.
 
 ## Windows platform and local IPC
 
@@ -440,3 +440,72 @@ menu behavior, Explorer restart, multiple monitors, and high-DPI rendering
 remain the desktop acceptance checks listed above. Existing CLI runner,
 clipboard-image, and shortcut results in earlier sections are retained as
 their original version's evidence, not reported as fresh full-suite runs.
+
+## Version 0.6 — manual presence (2026-10-22)
+
+The final sources build as native Linux tests and portable Windows x64
+executables. The Linux CTest run passed all three targets: store, CLI guide and
+routing, and window settings. Windows builds used MinGW-w64 GCC 13 with the
+existing warning flags and static runtime configuration.
+
+### Presence storage and CLI behavior
+
+The store suite passed all 35 groups on Linux and again as a Windows executable
+under Wine 9.0. The new groups verify:
+
+- Fresh and migrated state starts with unknown presence, an empty message,
+  and timestamp zero. Migration preserves existing requests and notes.
+- Only direct GUI calls can change presence. Invalid states, malformed UTF-8,
+  nulls, and messages above 500 UTF-8 bytes are rejected without partial writes.
+- Unicode messages, clearing text, no-op timestamps/events, restart persistence,
+  corrupt-file preservation, and recovery from a failed atomic save.
+- Presence changes leave requests, expiry, active leases, and the Quiet timer
+  unchanged. Read responses carry the current presence.
+- Condition-variable waits return pending when availability changes to Away
+  or Busy. Failed saves do not wake them as successful changes. Explicit waits
+  retain their budget, and a resolved decision takes precedence over presence.
+
+The CLI guide/routing target also passed under Wine. Mocked IPC checks cover
+read-only presence routing, ordinary requests enabling early return, detached
+creation receipts, explicit wait behavior, and invalid editing arguments.
+
+A separate smoke check ran the actual `knock.exe` and `KnockTray.exe` through
+their named pipe. It confirmed automatic tray startup, initial unknown status,
+rejection of a CLI status setter, Unicode presence reads, and an ordinary Away
+request returning pending with exit 7 and wait_reason=presence. The same
+request ID survived a one-second explicit wait, which honored its budget.
+Detached creation returned exit 0 with a pending record; status and cancellation
+responses retained the presence data and never produced an input lease.
+That check seeded an Away record while its private tray was stopped; actual
+status editing is covered separately through native GUI controls below.
+
+### Native interface and rendered checks
+
+The `inbox_ui` suite passed all 10 groups against the final application under
+Wine. It exercises GUI-only presence updates, the initially disabled Save,
+Unicode messages, draft/focus preservation through incoming activity, Back
+cancellation, UTF-8 length feedback, clearing text, persistence across restart,
+and At PC leaving unanswered requests pending. Status, settings, and existing
+lease/Quiet controls fit at the minimum 360 × 360 size.
+
+The `notes_ui` suite passed all 14 groups. Its existing editing, draft,
+search, Trash, and pagination checks remain covered. Two added groups exercise
+Find with an image attachment and task metadata at 360 × 360 with the status,
+input-lease, and Quiet strips together. The composer, action buttons, description,
+and metadata stay inside their parents without overlapping.
+
+During integration, the notebook test was corrected to use the empty-composer
+editing shortcut for its compact image fixture. Copy checks now wait for a
+clipboard sequence change before opening the clipboard, so the test cannot
+take the lock before the application writes. The application binaries were
+unchanged during those test corrections.
+
+Actual captures of the default status editor, saved Away inbox, minimum-size
+status and validation feedback, compact note composer, and compact task editor
+were inspected. The README includes the two default-size presence captures.
+All test records and desktops were isolated; the native suites controlled only
+their own spawned app and generated no global mouse or keyboard input.
+
+These are Wine checks, not Windows 11 desktop acceptance. Notification clicks,
+Explorer/taskbar behavior, Start-menu focus, multiple monitors, and high-DPI
+rendering still need the target desktop checks listed above.
