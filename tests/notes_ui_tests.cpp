@@ -178,14 +178,24 @@ void ctrl_find(HWND root) {
 }
 std::wstring clipboard() {
     eventually([] { return OpenClipboard(nullptr) != 0; }, "clipboard opens");
+    struct Close { ~Close() { CloseClipboard(); } } close;
     const auto handle = GetClipboardData(CF_UNICODETEXT);
     require(handle != nullptr, "Entry copy did not write text");
     const auto* text = static_cast<const wchar_t*>(GlobalLock(handle));
     require(text != nullptr, "Cannot read copied entry");
     const std::wstring result(text);
     GlobalUnlock(handle);
-    CloseClipboard();
     return result;
+}
+std::wstring copied_entry(HWND root, int y) {
+    const auto sequence = GetClipboardSequenceNumber();
+    entry_menu(root, y, {VK_END, VK_UP, VK_UP, VK_RETURN});
+    // A menu can close before its action finishes. Wait without opening the
+    // clipboard so the test cannot take the lock before the app writes it.
+    eventually([&] {
+        return GetClipboardSequenceNumber() != sequence && IsClipboardFormatAvailable(CF_UNICODETEXT);
+    }, "Copy entry writes Unicode text");
+    return clipboard();
 }
 void command(HWND root, const std::wstring& text) {
     set_text(edit(root, 30), text);
@@ -442,14 +452,12 @@ int main() {
         const auto query = edit(app.root, 51);
         enter(query);
         eventually([&] { return edit(app.root, 37) != nullptr; }, "search opens conversation");
-        entry_menu(app.root, 46, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Needle café entry 0", "Search did not jump to the first old matching entry");
+        require(copied_entry(app.root, 46) == L"Needle café entry 0", "Search did not jump to the first old matching entry");
         back(app.root);
         require(edit(app.root, 51) == query && caption(query) == L"NEEDLE CAFÉ", "Back lost the content query");
         message(query, WM_KEYDOWN, VK_DOWN);
         enter(query);
-        entry_menu(app.root, 46, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Needle café entry 120", "Second search result opened the wrong message");
+        require(copied_entry(app.root, 46) == L"Needle café entry 120", "Second search result opened the wrong message");
         passed("Unicode content search opens exact old entries and Back preserves the query and selection");
 
         ctrl_find(app.root);
@@ -457,14 +465,11 @@ int main() {
         set_text(find, L"needle");
         eventually([&] { return IsWindowEnabled(button(app.root, L"NEXT")); }, "within-note search completes");
         screenshot(app.root, L"note-find-in-note.bmp");
-        entry_menu(app.root, 104, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Needle café entry 0", "Ctrl+F did not search older paginated history");
+        require(copied_entry(app.root, 104) == L"Needle café entry 0", "Ctrl+F did not search older paginated history");
         click(button(app.root, L"NEXT"));
-        entry_menu(app.root, 104, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Needle café entry 120", "Next match did not jump to the second entry");
+        require(copied_entry(app.root, 104) == L"Needle café entry 120", "Next match did not jump to the second entry");
         click(button(app.root, L"PREV"));
-        entry_menu(app.root, 104, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Needle café entry 0", "Previous match did not wrap back correctly");
+        require(copied_entry(app.root, 104) == L"Needle café entry 0", "Previous match did not wrap back correctly");
         passed("Ctrl+F, Next and Previous search the full conversation across history pages");
 
         set_text(edit(app.root, 37), L"Keep this composer while finding things");
@@ -487,13 +492,11 @@ int main() {
         for (int index = 0; index < 100; ++index) message(edit(app.root, 51), WM_KEYDOWN, VK_DOWN);
         screenshot(app.root, L"note-search-second-page.bmp");
         enter(edit(app.root, 51));
-        entry_menu(app.root, 46, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Ordinary entry 101", "Next result page did not continue after its first 100 entries");
+        require(copied_entry(app.root, 46) == L"Ordinary entry 101", "Next result page did not continue after its first 100 entries");
         back(app.root);
         message(edit(app.root, 51), WM_KEYDOWN, VK_UP);
         enter(edit(app.root, 51));
-        entry_menu(app.root, 46, {VK_END, VK_UP, VK_UP, VK_RETURN});
-        require(clipboard() == L"Ordinary entry 100", "Previous result page did not retain its last selected entry");
+        require(copied_entry(app.root, 46) == L"Ordinary entry 100", "Previous result page did not retain its last selected entry");
         back(app.root);
         back(app.root);
         passed("content search moves across bounded result pages in both directions");
