@@ -352,7 +352,19 @@ int main() {
         message(app.root, WM_HOTKEY, 0x4B10, MAKELPARAM(MOD_CONTROL | MOD_ALT, 'K'));
         eventually([&] { return IsWindowVisible(app.root); }, "registered shortcut opens popup");
         require(FindWindowW(tray_class, nullptr) == original_window, "Shortcut toggle replaced the tray window");
-        passed("registered shortcut dispatch toggles the existing popup and ignores unrelated IDs");
+        message(app.root, WM_ACTIVATE, WA_INACTIVE, 0);
+        require(IsWindowVisible(app.root), "Hotkey-opened popup hid when another window took focus");
+        require(GetWindowLongPtrW(app.root, GWL_EXSTYLE) & WS_EX_TOPMOST,
+                "Hotkey-opened popup lost its topmost window style");
+        message(app.root, WM_HOTKEY, 0x4B10, MAKELPARAM(MOD_CONTROL | MOD_ALT, 'K'));
+        eventually([&] { return !IsWindowVisible(app.root); }, "shortcut still dismisses pinned popup");
+        message(app.root, WM_APP + 20);
+        eventually([&] { return IsWindowVisible(app.root); }, "ordinary reopen after pinned popup");
+        message(app.root, WM_ACTIVATE, WA_INACTIVE, 0);
+        eventually([&] { return !IsWindowVisible(app.root); }, "ordinary popup still dismisses on focus loss");
+        message(app.root, WM_HOTKEY, 0x4B10, MAKELPARAM(MOD_CONTROL | MOD_ALT, 'K'));
+        eventually([&] { return IsWindowVisible(app.root); }, "restore pinned popup for remaining checks");
+        passed("shortcut toggles a topmost popup that stays open on focus loss; ordinary opens stay transient");
 
         auto denied = create_request("GUI-NO");
         eventually([&] { return buttons(app.root, L"NO").size() == 1; }, "denial controls");

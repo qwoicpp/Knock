@@ -256,6 +256,7 @@ private:
     bool populating_ = false;
     bool context_menu_ = false;
     bool quitting_ = false;
+    bool keep_open_ = false;
     HWND footer_edit_ = nullptr;
     HWND title_edit_ = nullptr;
     HWND body_edit_ = nullptr;
@@ -428,7 +429,9 @@ private:
         banners_.push_back(std::move(banner));
         if (!active_banner_) next_banner();
     }
-    void show(const std::string& focus_id = {}) {
+    void show(const std::string& focus_id = {}, bool pinned = false) {
+        if (!IsWindowVisible(window_)) keep_open_ = pinned;
+        else if (pinned) keep_open_ = true;
         recover_completions();
         if (!focus_id.empty()) {
             if (!save_detail()) return;
@@ -483,6 +486,7 @@ private:
         if (!save_detail()) return;
         if (reply_edit_) drafts_[reply_id_] = narrow(edit_text(reply_edit_));
         ShowWindow(window_, SW_HIDE);
+        keep_open_ = false;
         KillTimer(window_, 2);
         request_sprite_.pause(); complete_sprite_.pause(); note_sprite_.pause();
     }
@@ -1988,7 +1992,7 @@ private:
         switch (message) {
         case WM_HOTKEY:
             if (!context_menu_ && hotkey_.matches(wparam)) {
-                if (IsWindowVisible(window_)) hide(); else show();
+                if (IsWindowVisible(window_)) hide(); else show({}, true);
             }
             return 0;
         case tray_message: {
@@ -2004,7 +2008,8 @@ private:
             return 0;
         }
         case WM_ACTIVATE:
-            if (LOWORD(wparam) == WA_INACTIVE && !context_menu_ && !quitting_) hide();
+            if (LOWORD(wparam) == WA_INACTIVE && IsWindowVisible(window_) &&
+                !keep_open_ && !context_menu_ && !quitting_) hide();
             return 0;
         case WM_SIZE: layout(); return 0;
         case WM_DPICHANGED: {
