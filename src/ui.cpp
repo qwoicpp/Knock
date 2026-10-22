@@ -921,7 +921,12 @@ private:
             feedback(L"Choose At PC, Away, or Busy first.");
             return;
         }
-        const auto message = narrow(edit_text(settings_presence_edit_));
+        std::string message;
+        try { message = narrow(edit_text(settings_presence_edit_)); }
+        catch (const std::exception&) {
+            feedback(L"Message contains invalid Unicode. Please edit it.");
+            return;
+        }
         if (message.size() > 500) {
             feedback(L"This message is too long (maximum 500 UTF-8 bytes).");
             return;
@@ -2668,8 +2673,9 @@ private:
         ShowWindow(title_edit_, SW_SHOW);
         int body_y = detail_ == Detail::note ? px(114) : px(81);
         note_body_y_ = body_y;
-        int body_bottom = detail_ == Detail::task ? area.bottom - px(130) : area.bottom - px(39);
-        MoveWindow(body_edit_, px(1), body_y, area.right - px(10), std::max(px(60), body_bottom - body_y), FALSE);
+        const int compact = area.bottom < px(260) ? px(9) : 0;
+        int body_bottom = detail_ == Detail::task ? area.bottom - px(130) + compact : area.bottom - px(39);
+        MoveWindow(body_edit_, px(1), body_y, area.right - px(10), std::max(px(18), body_bottom - body_y), FALSE);
         ShowWindow(body_edit_, tag_picker_open_ ? SW_HIDE : SW_SHOW);
         if (detail_ == Detail::note) {
             button("note-tags", content_, L"TAGS", rect(0, px(80), px(64), px(23)),
@@ -2678,8 +2684,8 @@ private:
         }
         if (detail_ == Detail::task) {
             int half = (area.right - px(12)) / 2;
-            MoveWindow(operator_edit_, 0, area.bottom - px(99), half, px(23), FALSE);
-            MoveWindow(project_edit_, half + px(12), area.bottom - px(99), half, px(23), FALSE);
+            MoveWindow(operator_edit_, 0, area.bottom - px(99) + compact, half, px(23), FALSE);
+            MoveWindow(project_edit_, half + px(12), area.bottom - px(99) + compact, half, px(23), FALSE);
             ShowWindow(operator_edit_, SW_SHOW);
             ShowWindow(project_edit_, SW_SHOW);
             const char* values[] = {"todo", "in_progress", "done"};
@@ -2715,7 +2721,6 @@ private:
             return;
         }
         const auto& composer_images = composer_draft().images;
-        const int attachments = composer_images.empty() ? 0 : px(55);
         if (note_find_open_) {
             MoveWindow(note_find_edit_, px(5), px(41), area.right - px(147), px(22), FALSE);
             button("note-find-prev", content_, L"PREV", rect(area.right - px(135), px(40), px(42), px(24)),
@@ -2726,10 +2731,15 @@ private:
                    [this] { close_note_find(); });
         }
         const int history_top = px(note_find_open_ ? 93 : 35);
+        // Keep a usable composer when Find, attachments and the header strips
+        // share the minimum-height popup. Full-size previews return as space allows.
+        const int available = static_cast<int>(area.bottom) - history_top - px(37);
+        const int attachments = composer_images.empty() ? 0 : std::clamp(available - px(59), px(27), px(55));
+        const int composer_height = std::clamp(available - attachments - px(24), px(35), px(57));
         note_history_bounds_ = RECT{0, history_top, area.right,
-            std::max(history_top + px(35), static_cast<int>(area.bottom) - px(94) - attachments)};
+            static_cast<int>(area.bottom) - px(37) - composer_height - attachments};
         note_composer_bounds_ = RECT{0, note_history_bounds_.bottom + px(8) + attachments, area.right, area.bottom - px(29)};
-        note_attachment_bounds_ = RECT{0, note_history_bounds_.bottom + px(8), area.right, note_history_bounds_.bottom + px(55)};
+        note_attachment_bounds_ = RECT{0, note_history_bounds_.bottom + px(8), area.right, note_history_bounds_.bottom + attachments};
         MoveWindow(composer_edit_, px(5), note_composer_bounds_.top + px(5), area.right - px(16),
                    std::max(px(25), static_cast<int>(note_composer_bounds_.bottom - note_composer_bounds_.top) - px(10)), FALSE);
         const int send_width = note_edit_ ? px(88) : px(62);
@@ -2739,7 +2749,8 @@ private:
         if (note_edit_)
             button("note-edit-cancel", content_, L"CANCEL", rect(area.right - send_width - px(74), area.bottom - px(23), px(66), px(22)),
                    [this] { cancel_note_message_edit(); });
-        int attachment_width = std::min(px(45), static_cast<int>(area.right) / 8);
+        const int attachment_height = std::max(px(14), static_cast<int>(note_attachment_bounds_.bottom - note_attachment_bounds_.top) - px(5));
+        int attachment_width = std::min({px(45), static_cast<int>(area.right) / 8, attachment_height + px(3)});
         for (std::size_t i = 0; i < composer_images.size(); ++i) {
             const auto name = composer_images[i];
             int left = static_cast<int>(i) * (attachment_width + px(3));
@@ -3057,7 +3068,8 @@ private:
         text(dc, detail_ == Detail::note ? L"NOTE" : L"TASK", RECT{px(82), px(3), area.right - px(82), px(23)},
              small_font_, muted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         outline(dc, RECT{0, px(38), area.right, px(68)}, border);
-        int body_bottom = detail_ == Detail::task ? area.bottom - px(130) : area.bottom - px(39);
+        const int compact = area.bottom < px(260) ? px(9) : 0;
+        int body_bottom = detail_ == Detail::task ? area.bottom - px(130) + compact : area.bottom - px(39);
         if (detail_ == Detail::note) {
             auto tags = tag_caption(detail_tags_);
             text(dc, tags.empty() ? L"Add tags" : tags,
@@ -3071,10 +3083,10 @@ private:
         }
         if (detail_ == Detail::task) {
             int half = (area.right - px(12)) / 2;
-            text(dc, L"OPERATOR", RECT{0, area.bottom - px(117), half, area.bottom - px(100)}, small_font_, muted);
-            text(dc, L"PROJECT", RECT{half + px(12), area.bottom - px(117), area.right, area.bottom - px(100)}, small_font_, muted);
-            fill(dc, RECT{0, area.bottom - px(75), half, area.bottom - px(75) + 1}, border);
-            fill(dc, RECT{half + px(12), area.bottom - px(75), area.right, area.bottom - px(75) + 1}, border);
+            text(dc, L"OPERATOR", RECT{0, area.bottom - px(117) + compact, half, area.bottom - px(100) + compact}, small_font_, muted);
+            text(dc, L"PROJECT", RECT{half + px(12), area.bottom - px(117) + compact, area.right, area.bottom - px(100) + compact}, small_font_, muted);
+            fill(dc, RECT{0, area.bottom - px(75) + compact, half, area.bottom - px(75) + compact + 1}, border);
+            fill(dc, RECT{half + px(12), area.bottom - px(75) + compact, area.right, area.bottom - px(75) + compact + 1}, border);
         }
         text(dc, detail_dirty_ ? L"Saving..." : L"Saved locally. Ctrl+Enter to save.",
             RECT{0, area.bottom - px(26), area.right - px(81), area.bottom - px(5)}, small_font_, subdued,
@@ -3135,11 +3147,12 @@ private:
         draw_editor_scroll(dc, composer_edit_);
         const auto& images = composer_draft().images;
         if (!images.empty()) {
-            int attachment_width = std::min(px(45), static_cast<int>(area.right) / 8);
+            const int attachment_height = std::max(px(14), static_cast<int>(note_attachment_bounds_.bottom - note_attachment_bounds_.top) - px(5));
+            int attachment_width = std::min({px(45), static_cast<int>(area.right) / 8, attachment_height + px(3)});
             for (std::size_t i = 0; i < images.size(); ++i) {
                 int left = static_cast<int>(i) * (attachment_width + px(3));
                 draw_note_image(dc, images[i], RECT{left, note_attachment_bounds_.top,
-                    left + attachment_width, note_attachment_bounds_.top + px(42)});
+                    left + attachment_width, note_attachment_bounds_.top + attachment_height});
             }
         }
         text(dc, note_edit_ ? L"Editing entry" : L"Enter to add  /  Shift+Enter for a new line",
