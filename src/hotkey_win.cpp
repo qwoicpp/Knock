@@ -258,7 +258,7 @@ bool HotkeyManager::initialize(HWND owner) {
     }
     if (!binding_.enabled) return true;
     if (!RegisterHotKey(owner_, first_hotkey_id, binding_.modifiers | MOD_NOREPEAT, binding_.key)) {
-        error_ = L"Shortcut is already in use or reserved by Windows. Choose another shortcut from the tray menu.";
+        error_ = L"Shortcut is already in use or reserved by Windows. Choose another shortcut in Settings.";
         return false;
     }
     active_id_ = first_hotkey_id;

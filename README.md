@@ -20,6 +20,10 @@ not. I'll keep changing it as I use it.
 
 ![A personal note conversation](docs/screenshots/note-conversation.png)
 
+![Finding a note by its title](docs/screenshots/note-find.png)
+
+![The Settings page](docs/screenshots/settings.png)
+
 These use sample records. Your own install starts empty.
 
 ## Using it
@@ -28,10 +32,20 @@ Extract the whole Windows x64 zip into a folder you want to keep, then run
 **KnockTray.exe**. Keep **knock.exe** and the **assets** folder beside it.
 There's no extra application runtime to install.
 
-Click the tray icon or press **Ctrl + Alt + K** to open or hide it. You can
-change or disable that shortcut through **right-click tray → Shortcut**. Click
-away or press Escape to hide the popup; quit from the tray menu. **Start with
-Windows** is in that menu too, if you want it.
+Click the tray icon or press **Ctrl + Alt + K** to open or hide it. Opening
+from the tray gives you a popup that hides when you click away. Opening with
+the shortcut keeps it open and on top while you use other windows. Press the
+shortcut again or choose **Hide Knock** from the right-click menu when you're
+done. **Escape** backs out of the current view, then hides the popup.
+
+Right-click anywhere in the popup and choose **Settings** to make it yours:
+
+- **CHANGE** lets you record a different hotkey or disable it.
+- Set the window width and height, then **APPLY**. The range is 360–800 wide
+  and 360–1000 tall, in logical pixels; **RESET** returns to 420 × 510.
+- Turn on **Start with Windows** if you want it there when you log in.
+
+You can also open Settings or quit Knock from the tray menu.
 
 To update, quit the running copy and replace its application files. Saved data
 lives separately, so your notes and tasks stay put.
@@ -50,6 +64,21 @@ conversation for that note. A name like “Websites” or “Project ideas” is
 
 It's your own notebook. Nothing in a note gets executed or sent to an AI.
 Existing notes from earlier versions keep their text as the first message.
+
+For finding and clearing things out, the title box on the **Notes list** also
+takes a couple of commands:
+
+- **`/find-note`** opens a search page. Add a name, like
+  **`/find-note websites`**, or just type on that page to narrow the results.
+  Exact titles come first, then titles that start with or contain what you
+  typed. Click a result or select it with the arrow keys and press **Enter**.
+- **`/delete-note`** opens a separate list for deleting notes. You can add a
+  search after this command too. Clicking a **DELETE** row deletes that note;
+  **Back** takes you out of the list.
+
+Type **`/`** to see the available commands as you type. Use the arrow keys and
+**Enter**, or click a suggestion. An unknown slash command won't create a note.
+These commands belong to the Notes list; text inside a note stays your text.
 
 ### Agents
 
@@ -115,8 +144,9 @@ The source also includes a MinGW cross-build toolchain and Linux core tests;
 see [HANDOFF.md](HANDOFF.md) and [VALIDATION.md](docs/VALIDATION.md).
 
 The executables and UI have been exercised under Wine on Linux. Actual Windows
-11 notification, taskbar, display-scaling, and multi-monitor behavior still
-need desktop checks. The validation notes say exactly what was tested.
+11 notification, taskbar, Start-menu/focus, display-scaling, and multi-monitor
+behavior still need desktop checks. The validation notes say exactly what was
+tested.
 
 More detail: [CLI reference](docs/CLI.md) · [local protocol](docs/PROTOCOL.md) ·
 [feature tracker](docs/FEATURES.md).

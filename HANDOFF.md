@@ -6,14 +6,18 @@ Knock is a compact Windows tray app with a terminal-style interface. Native Win3
 
 ## Implementation
 
-Version 0.3.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
+Version 0.4.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
 `knock.exe`, and the `assets` directory together. There is no web runtime,
 server account, or network listener.
 
 - C++20, Win32/GDI/GDI+, per-account/session named pipe, durable JSON store.
-- UI reference: 420 x 510 logical pixels, #090909 background, #151515 tabs,
-  #474747 borders, light monospace text, bundled pixel art. The popup uses
-  tool-window flags, hides when deactivated, and has no window controls.
+- UI reference: default 420 × 510 logical pixels, #090909 background, #151515
+  tabs, #474747 borders, light monospace text, bundled pixel art. Settings
+  allow widths of 360–800 and heights of 360–1000 logical pixels, clamped to
+  the monitor work area when shown. The popup uses tool-window flags and has
+  no window controls. Opening from the tray hides on deactivation; opening by
+  hotkey keeps it topmost and open across focus changes until toggled or hidden.
+  Escape backs out of the current view before hiding the popup.
 - Requests require a chat label. Yes, No, and custom replies are persisted.
   Only trusted UI calls may resolve requests. A custom reply never grants input.
 - Input approvals are exclusive, time-limited cooperative leases. Release,
@@ -25,8 +29,18 @@ server account, or network listener.
 - Notes are personal conversations: Enter sends composer text and pasted images;
   Shift+Enter inserts a newline. EDIT opens title/description metadata; TAGS
   opens the tag selector. Descriptions remain separate from message history.
-  Notes retain tag/Untagged
-  filters. Old note bodies migrate once to a first message without losing text.
+  Notes retain tag/Untagged filters. Old note bodies migrate once to a first
+  message without losing text.
+- In the Notes list, `/find-note [query]` opens live, case-insensitive title
+  search ranked by exact match, prefix, then substring. `/delete-note [query]`
+  opens a dedicated click-to-delete page with Back. Slash-prefix suggestions
+  and results support arrow keys and Enter; unknown commands never create a
+  note. Commands are not interpreted inside note conversations.
+- Clearing a title leaves the editor blank through background saves and
+  incoming updates. Explicit save/navigation requires a nonblank title and
+  keeps focus on the draft when validation fails. Hiding preserves the current
+  editor without restoring the previous title; unsaved metadata is not a
+  restart-persistent draft.
 - Composer drafts survive view changes, hiding, incoming updates, and restart.
   A persisted client_id makes sending and crash recovery idempotent. External
   deletion preserves unsaved work rather than silently dropping it.
@@ -34,9 +48,13 @@ server account, or network listener.
   input/decoded dimensions and thumbnails. Removing attachments or deleting
   messages/notes leaves the imported files on disk intentionally; there is no
   automatic attachment garbage collection.
-- Ctrl+Alt+K toggles the popup. The tray Shortcut dialog can change or disable it.
-  Settings save atomically; registration conflicts and failed writes preserve
-  the previous working shortcut.
+- Ctrl+Alt+K toggles the popup by default. Right-click anywhere in the popup
+  for Settings, where CHANGE opens shortcut capture with a disable option.
+  The page also has window-size APPLY/RESET and Start with Windows. Shortcut
+  and size changes save atomically to the shared settings file while preserving
+  unrelated preferences; registration conflicts and failed writes preserve the
+  previous working shortcut and size. Invalid settings report an error instead
+  of silently replacing the file. The tray menu also opens Settings.
 - Terminal-style tabs have icons, separate tab surfaces,
   and an active tab connected to the content. Scroll thumbs are one logical
   pixel wide, with wider invisible drag targets.
@@ -58,7 +76,8 @@ server account, or network listener.
 | Tray lifecycle and rendering | `src/tray_main.cpp`, `src/ui.cpp` |
 | GIF decoding, crop, and timing | `src/sprite_win.cpp`, `include/knock/sprite.hpp` |
 | Clipboard images and thumbnail rendering | `src/note_images_win.cpp`, `include/knock/note_images.hpp` |
-| Global shortcut and settings dialog | `src/hotkey_win.cpp`, `include/knock/hotkey.hpp` |
+| Global shortcut and capture dialog | `src/hotkey_win.cpp`, `include/knock/hotkey.hpp` |
+| Popup dimensions and shared settings persistence | `src/window_settings.cpp`, `include/knock/window_settings.hpp` |
 | Correctness and integration checks | `tests/` |
 
 See README.md for build commands, docs/CLI.md for command usage, and
@@ -78,17 +97,15 @@ send. Keep that boundary intact when changing composer or draft handling.
 
 ## Verification and remaining desktop checks
 
-The version-0.3 build is warning-free. All 23 core groups passed natively on
-Linux. The Windows binaries passed 15 GUI, 13 CLI, five image-helper, and six
-shortcut groups under Wine. Direct keyboard checks exercised image paste,
-multiline sending, and the global shortcut. Sampling 81 frames across 27 tab
-changes found no full-white frame. These are Wine observations, not a guarantee
-about every Windows display frame. Details and earlier platform/GIF checks are
-recorded in docs/VALIDATION.md.
+Current verification results and the previous release's baseline are recorded
+in docs/VALIDATION.md. Keep native Linux checks, Windows executables exercised
+under Wine, and actual Windows desktop checks distinct. A successful Wine run
+does not establish how the Windows shell will behave.
 
 Real Windows 11 notification delivery/click behavior, actual taskbar rendering,
-multi-monitor placement, and high-DPI behavior remain desktop acceptance checks.
-Do not turn Wine results into a claim that those Windows shell cases were tested.
+Start-menu/focus behavior for the pinned popup, multi-monitor placement, and
+high-DPI behavior remain desktop acceptance checks. Do not turn Wine results
+into a claim that those Windows shell cases were tested.
 `tests/cli_smoke.ps1` is available for native Windows verification.
 
 Future work should follow desktop feedback and stay within the existing local

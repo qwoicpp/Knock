@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Knock VERSION 0.3.0 LANGUAGES CXX)
+project(Knock VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -113,6 +113,7 @@ if(WIN32)
     install(FILES docs/VALIDATION.md docs/PROTOCOL.md docs/FEATURES.md
         docs/CLI.md docs/AGENT_INSTRUCTIONS.md DESTINATION docs)
     install(FILES docs/screenshots/inbox.png docs/screenshots/note-conversation.png
+        docs/screenshots/note-find.png docs/screenshots/settings.png
         DESTINATION docs/screenshots)
     install(FILES third_party/nlohmann-LICENSE.txt DESTINATION licenses)
 endif()
