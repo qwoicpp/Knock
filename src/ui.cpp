@@ -218,7 +218,7 @@ private:
     enum class Detail { none, task, note };
     enum class SaveIntent { explicit_action, background };
     enum class SettingsPage { general, preferences, replies, reply };
-    enum class NotePage { list, find, remove, trash };
+    enum class NotePage { list, find, remove, trash, search };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
         HWND handle = nullptr;
@@ -294,8 +294,14 @@ private:
     HWND tag_query_edit_ = nullptr;
     HWND composer_edit_ = nullptr;
     HWND note_query_edit_ = nullptr;
+    HWND note_find_edit_ = nullptr;
     NotePage note_page_ = NotePage::list;
     std::vector<Json> note_results_;
+    bool note_results_dirty_ = true;
+    bool note_search_pending_ = false;
+    std::size_t note_search_page_offset_ = 0;
+    std::size_t note_search_total_ = 0;
+    std::optional<std::size_t> note_search_next_;
     std::string note_selected_id_;
     int note_result_offset_ = 0;
     int note_result_rows_ = 1;
@@ -303,12 +309,20 @@ private:
     bool dragging_note_results_ = false;
     std::vector<NotePage> note_command_choices_;
     std::size_t note_command_selection_ = 0;
+    std::size_t note_command_first_ = 0;
+    std::size_t note_command_visible_ = 0;
     RECT note_command_bounds_{};
     ULONGLONG note_delete_click_until_ = 0;
     std::string note_undo_id_;
     std::string note_undo_title_;
     ULONGLONG note_undo_until_ = 0;
     RECT note_undo_bounds_{};
+    bool note_find_open_ = false;
+    bool note_find_pending_ = false;
+    std::vector<Json> note_find_results_;
+    std::size_t note_find_selection_ = 0;
+    std::string note_highlight_id_;
+    ULONGLONG note_highlight_until_ = 0;
     bool note_metadata_open_ = false;
     bool note_draft_dirty_ = false;
     NoteDraft note_draft_;
@@ -378,7 +392,7 @@ private:
         small_font_ = make(10, FW_NORMAL);
         title_font_ = make(13, FW_NORMAL);
         for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_,
-                          settings_width_edit_, settings_height_edit_, settings_retention_edit_, settings_reply_edit_, note_query_edit_})
+                          settings_width_edit_, settings_height_edit_, settings_retention_edit_, settings_reply_edit_, note_query_edit_, note_find_edit_})
             if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), TRUE);
     }
     void text(HDC dc, const std::wstring& value, RECT bounds, HFONT font,
@@ -958,13 +972,17 @@ private:
     }
     void destroy_detail_edits() {
         reset_tag_picker();
-        for (HWND* edit : {&title_edit_, &body_edit_, &operator_edit_, &project_edit_, &composer_edit_}) {
+        for (HWND* edit : {&title_edit_, &body_edit_, &operator_edit_, &project_edit_, &composer_edit_, &note_find_edit_}) {
             if (*edit) DestroyWindow(*edit);
             *edit = nullptr;
         }
         detail_dirty_ = false;
         note_metadata_open_ = false;
         note_edit_.reset();
+        note_find_open_ = false;
+        note_find_pending_ = false;
+        note_find_results_.clear();
+        note_highlight_id_.clear();
         note_rows_.clear();
         note_image_cache_.clear();
         KillTimer(window_, 4);
@@ -1096,6 +1114,7 @@ private:
         switch (page) {
         case NotePage::remove: return "/delete-note";
         case NotePage::trash: return "/trash";
+        case NotePage::search: return "/search-notes";
         default: return "/find-note";
         }
     }
@@ -1103,6 +1122,7 @@ private:
         switch (page) {
         case NotePage::remove: return L"  Delete notes with a click";
         case NotePage::trash: return L"  Restore deleted notes";
+        case NotePage::search: return L"  Search inside notes";
         default: return L"  Find a note by name";
         }
     }
@@ -1146,9 +1166,17 @@ private:
         feedback_.clear();
         reset_tag_picker();
         note_page_ = page;
+        note_results_dirty_ = true;
+        note_search_pending_ = false;
+        note_search_page_offset_ = 0;
+        note_search_total_ = 0;
+        note_search_next_.reset();
         note_result_offset_ = 0;
         note_selected_id_.clear();
-        if (!note_query_edit_) note_query_edit_ = make_edit(content_, 51, false, L"Find a note by name...");
+        if (!note_query_edit_) note_query_edit_ = make_edit(content_, 51, false, L"Search...");
+        SendMessageW(note_query_edit_, EM_SETLIMITTEXT, page == NotePage::search ? 128 : 512, 0);
+        SendMessageW(note_query_edit_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(
+            page == NotePage::search ? L"Search conversation text..." : L"Find a note by name..."));
         populating_ = true;
         SetWindowTextW(note_query_edit_, widen(query).c_str());
         if (footer_edit_) SetWindowTextW(footer_edit_, L"");
@@ -1161,6 +1189,7 @@ private:
         note_page_ = NotePage::list;
         note_results_.clear();
         note_selected_id_.clear();
+        note_search_pending_ = false;
         if (note_query_edit_) DestroyWindow(note_query_edit_);
         note_query_edit_ = nullptr;
         layout();
@@ -1171,7 +1200,7 @@ private:
         const auto split = value.find_first_of(" \t");
         const auto name = tag_key(value.substr(0, split));
         const auto query = split == std::string::npos ? std::string() : trim(value.substr(split + 1));
-        for (NotePage page : {NotePage::find, NotePage::remove, NotePage::trash}) {
+        for (NotePage page : {NotePage::find, NotePage::search, NotePage::remove, NotePage::trash}) {
             if (name == note_command_name(page)) { open_note_page(page, query); return; }
         }
         if (split == std::string::npos && !note_command_choices_.empty()) {
@@ -1188,11 +1217,38 @@ private:
         if (value.empty() || value.front() != '/') return;
         const auto split = value.find_first_of(" \t");
         const auto prefix = value.substr(0, split);
-        for (NotePage page : {NotePage::find, NotePage::remove, NotePage::trash})
+        for (NotePage page : {NotePage::find, NotePage::search, NotePage::remove, NotePage::trash})
             if (std::string(note_command_name(page)).starts_with(prefix)) note_command_choices_.push_back(page);
         note_command_selection_ = std::min(note_command_selection_, note_command_choices_.empty() ? 0 : note_command_choices_.size() - 1);
     }
     void update_note_results() {
+        if (note_page_ == NotePage::search) {
+            if (!note_results_dirty_ || note_search_pending_) return;
+            note_results_dirty_ = false;
+            note_results_.clear();
+            note_search_total_ = 0;
+            note_search_next_.reset();
+            const auto query = trim(narrow(edit_text(note_query_edit_)));
+            if (!query.empty()) {
+                auto result = mutate({{"op", "note.search"}, {"query", query},
+                    {"offset", note_search_page_offset_}, {"limit", 100}});
+                if (result.value("ok", false)) {
+                    note_search_total_ = result.at("total").get<std::size_t>();
+                    if (note_search_page_offset_ && note_search_page_offset_ >= note_search_total_) {
+                        note_search_page_offset_ = note_search_total_ ? ((note_search_total_ - 1) / 100) * 100 : 0;
+                        note_results_dirty_ = true;
+                        update_note_results();
+                        return;
+                    }
+                    for (auto& item : result.at("items")) note_results_.push_back(std::move(item));
+                    if (!result.at("next_offset").is_null()) note_search_next_ = result.at("next_offset").get<std::size_t>();
+                }
+            }
+            if (std::none_of(note_results_.begin(), note_results_.end(), [this](const auto& item) {
+                    return note_result_id(item) == note_selected_id_;
+                })) note_selected_id_ = note_results_.empty() ? std::string() : note_result_id(note_results_.front());
+            return;
+        }
         const auto query = widen(trim(narrow(edit_text(note_query_edit_))));
         struct Match { Json item; int rank; };
         std::vector<Match> matches;
@@ -1214,7 +1270,29 @@ private:
         });
         if (!selected_exists) note_selected_id_ = note_results_.empty() ? std::string() : get_string(note_results_.front(), "id");
     }
+    std::string note_result_id(const Json& item) const {
+        return note_page_ == NotePage::search ? get_string(item, "note_id") + ":" + get_string(item, "message_id") :
+            get_string(item, "id");
+    }
+    void change_search_page(std::size_t offset, bool at_end = false) {
+        note_search_page_offset_ = offset;
+        note_results_dirty_ = true;
+        note_selected_id_.clear();
+        update_note_results();
+        note_result_offset_ = at_end ? std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_) : 0;
+        if (at_end && !note_results_.empty()) note_selected_id_ = note_result_id(note_results_.back());
+        layout();
+    }
     void scroll_note_results(int rows) {
+        if (note_page_ == NotePage::search) {
+            const int end = std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_);
+            if (rows > 0 && note_result_offset_ >= end && note_search_next_) {
+                change_search_page(*note_search_next_); return;
+            }
+            if (rows < 0 && note_result_offset_ == 0 && note_search_page_offset_) {
+                change_search_page(note_search_page_offset_ > 100 ? note_search_page_offset_ - 100 : 0, true); return;
+            }
+        }
         const int offset = std::clamp(note_result_offset_ + rows, 0,
             std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_));
         if (offset == note_result_offset_) return;
@@ -1224,16 +1302,36 @@ private:
     void move_note_selection(int amount) {
         if (note_results_.empty()) return;
         auto selected = std::find_if(note_results_.begin(), note_results_.end(), [this](const Json& item) {
-            return get_string(item, "id") == note_selected_id_;
+            return note_result_id(item) == note_selected_id_;
         });
+        if (note_page_ == NotePage::search && selected != note_results_.end()) {
+            if (amount > 0 && std::next(selected) == note_results_.end() && note_search_next_) {
+                change_search_page(*note_search_next_); return;
+            }
+            if (amount < 0 && selected == note_results_.begin() && note_search_page_offset_) {
+                change_search_page(note_search_page_offset_ > 100 ? note_search_page_offset_ - 100 : 0, true); return;
+            }
+        }
         const int index = std::clamp(static_cast<int>(selected - note_results_.begin()) + amount,
             0, static_cast<int>(note_results_.size()) - 1);
-        note_selected_id_ = get_string(note_results_[static_cast<std::size_t>(index)], "id");
+        note_selected_id_ = note_result_id(note_results_[static_cast<std::size_t>(index)]);
         if (index < note_result_offset_) note_result_offset_ = index;
         if (index >= note_result_offset_ + note_result_rows_) note_result_offset_ = index - note_result_rows_ + 1;
         layout();
     }
     void activate_note_result(const Json& item) {
+        if (note_page_ == NotePage::search) {
+            note_selected_id_ = note_result_id(item);
+            const auto id = get_string(item, "note_id");
+            const auto& notes = snapshot_["notes"];
+            const auto note = std::find_if(notes.begin(), notes.end(), [&id](const auto& value) {
+                return get_string(value, "id") == id;
+            });
+            if (note == notes.end()) { feedback(L"This note is no longer available."); return; }
+            begin_detail(Detail::note, *note);
+            if (detail_ == Detail::note && detail_id_ == id) jump_to_note_message(get_string(item, "message_id"));
+            return;
+        }
         const auto id = get_string(item, "id");
         if (note_page_ == NotePage::find) {
             note_selected_id_ = id;
@@ -1254,6 +1352,12 @@ private:
         SetFocus(note_query_edit_);
     }
     bool note_keys(HWND target, WPARAM key) {
+        if (!settings_open_ && detail_ == Detail::note) {
+            if (key == 'F' && GetKeyState(VK_CONTROL) < 0) { open_note_find(); return true; }
+            if (note_find_open_ && (key == VK_F3 || (target == note_find_edit_ && key == VK_RETURN))) {
+                move_note_find(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); return true;
+            }
+        }
         if (!settings_open_ && detail_ == Detail::note && !note_metadata_open_ && !tag_picker_open_ &&
             target == composer_edit_ && key == VK_UP && GetKeyState(VK_CONTROL) >= 0 &&
             GetKeyState(VK_SHIFT) >= 0 && GetKeyState(VK_MENU) >= 0 && !note_edit_ &&
@@ -1271,9 +1375,9 @@ private:
         if (key == VK_UP || key == VK_DOWN) { move_note_selection(key == VK_UP ? -1 : 1); return true; }
         if (key == VK_RETURN) {
             // Deletion is an explicit row action, never a side effect of typing a query.
-            if (note_page_ == NotePage::find) {
+            if (note_page_ == NotePage::find || note_page_ == NotePage::search) {
                 auto selected = std::find_if(note_results_.begin(), note_results_.end(), [this](const Json& item) {
-                    return get_string(item, "id") == note_selected_id_;
+                    return note_result_id(item) == note_selected_id_;
                 });
                 if (selected != note_results_.end()) activate_note_result(*selected);
             }
@@ -1590,6 +1694,89 @@ private:
         note_scroll_ = std::clamp(previous_scroll + note_history_height_ - previous_height, 0, note_scroll_limit());
         layout();
     }
+    void jump_to_note_message(const std::string& id) {
+        auto result = store_.handle({{"op", "note.message.get"}, {"id", detail_id_}, {"message_id", id}});
+        if (!result.value("ok", false)) {
+            feedback(L"This entry is no longer available.");
+            return;
+        }
+        const auto index = result.at("message_index").get<std::size_t>();
+        const bool loaded = std::any_of(note_messages_.begin(), note_messages_.end(), [&id](const auto& message) {
+            return get_string(message, "id") == id;
+        });
+        if (!loaded || index < note_offset_) {
+            note_offset_ = index > 10 ? index - 10 : 0;
+            if (!load_note_history()) return;
+        }
+        layout();
+        for (const auto& row : note_rows_) {
+            if (get_string(note_messages_[row.index], "id") != id) continue;
+            note_scroll_ = std::clamp(row.top - px(8), 0, note_scroll_limit());
+            note_highlight_id_ = id;
+            note_highlight_until_ = GetTickCount64() + 5000;
+            layout();
+            return;
+        }
+        feedback(L"This entry changed while the search was open. Search again.");
+    }
+    void open_note_find() {
+        if (detail_ != Detail::note) return;
+        if (note_metadata_open_) {
+            open_note_metadata();
+            if (note_metadata_open_) return;
+        }
+        if (tag_picker_open_) close_tag_picker();
+        if (!note_find_edit_) {
+            note_find_edit_ = make_edit(content_, 52, false, L"Find in this conversation...");
+            SendMessageW(note_find_edit_, EM_SETLIMITTEXT, 128, 0);
+        }
+        const bool newly_opened = !note_find_open_;
+        note_find_open_ = true;
+        if (newly_opened && !edit_text(note_find_edit_).empty()) refresh_note_find();
+        layout();
+        SetFocus(note_find_edit_);
+        SendMessageW(note_find_edit_, EM_SETSEL, 0, -1);
+    }
+    void close_note_find() {
+        note_find_open_ = false;
+        note_find_pending_ = false;
+        layout();
+        SetFocus(composer_edit_);
+    }
+    void refresh_note_find(bool jump = true) {
+        if (!note_find_open_ || detail_ != Detail::note || !note_find_edit_) return;
+        const auto previous_id = note_find_selection_ < note_find_results_.size() ?
+            get_string(note_find_results_[note_find_selection_], "message_id") : std::string();
+        note_find_results_.clear();
+        note_find_selection_ = 0;
+        note_find_pending_ = false;
+        const auto query = trim(narrow(edit_text(note_find_edit_)));
+        if (query.empty()) { layout(); return; }
+        std::size_t offset = 0;
+        for (;;) {
+            auto result = mutate({{"op", "note.search"}, {"id", detail_id_}, {"query", query},
+                                  {"offset", offset}, {"limit", 100}});
+            if (!result.value("ok", false)) { layout(); return; }
+            for (auto& item : result.at("items")) note_find_results_.push_back(std::move(item));
+            if (result.at("next_offset").is_null()) break;
+            const auto next = result.at("next_offset").get<std::size_t>();
+            if (next <= offset) throw std::runtime_error("Note search did not advance");
+            offset = next;
+        }
+        const auto previous = std::find_if(note_find_results_.begin(), note_find_results_.end(), [&previous_id](const auto& item) {
+            return get_string(item, "message_id") == previous_id;
+        });
+        if (previous != note_find_results_.end()) note_find_selection_ = static_cast<std::size_t>(previous - note_find_results_.begin());
+        if (jump && !note_find_results_.empty()) jump_to_note_message(get_string(note_find_results_[note_find_selection_], "message_id"));
+        else layout();
+    }
+    void move_note_find(int direction) {
+        if (note_find_pending_) { refresh_note_find(); return; }
+        if (note_find_results_.empty()) return;
+        if (direction < 0) note_find_selection_ = (note_find_selection_ + note_find_results_.size() - 1) % note_find_results_.size();
+        else note_find_selection_ = (note_find_selection_ + 1) % note_find_results_.size();
+        jump_to_note_message(get_string(note_find_results_[note_find_selection_], "message_id"));
+    }
     void open_note_metadata() {
         if (note_metadata_open_) {
             if (!save_detail()) return;
@@ -1778,6 +1965,7 @@ private:
         }
         std::vector<MenuItem> items{{1, L"Settings...", !settings_open_}, {2, L"Hide Knock"},
             {3, busy() ? busy_caption() : L"Busy for..."}};
+        if (!settings_open_ && detail_ == Detail::note) items.push_back({24, L"Find in note...  Ctrl+F"});
         wchar_t class_name[16]{};
         GetClassNameW(source, class_name, 16);
         const bool editor = lstrcmpiW(class_name, L"Edit") == 0;
@@ -1828,6 +2016,7 @@ private:
         if (selected == 20) { copy(get_string(entry, "text")); feedback(L"Entry copied."); }
         if (selected == 21) open_note_image(filename);
         if (selected == 23) begin_note_message_edit(entry);
+        if (selected == 24) open_note_find();
         if (selected == 22) {
             const bool previous_menu = context_menu_;
             context_menu_ = true;
@@ -2008,12 +2197,13 @@ private:
             text(item.hDC, deleting ? L"DELETE" : note_page_ == NotePage::trash ? L"RESTORE" : L"OPEN",
                 RECT{bounds.right - px(61), px(6), bounds.right - px(8), px(24)}, small_font_, deleting ? orange : muted,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-            auto caption = note_page_ == NotePage::trash ?
+            auto caption = note_page_ == NotePage::search ? widen(get_string(button.record, "excerpt")) :
+                note_page_ == NotePage::trash ?
                 L"Deleted " + display_time(button.record.value("deleted_at", std::int64_t(0))) :
                 tag_caption(tags_of(button.record));
             if (caption.empty()) caption = L"Untagged";
             text(item.hDC, caption, RECT{px(8), px(28), bounds.right - px(8), bounds.bottom - px(5)},
-                small_font_, muted, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                small_font_, muted, (note_page_ == NotePage::search ? DT_WORDBREAK : DT_SINGLELINE) | DT_END_ELLIPSIS | DT_NOPREFIX);
         } else if (button.card) {
             auto title = (tab_ == Tab::tasks ? L"TASK: " : L"") + widen(get_string(button.record, "title"));
             RECT title_bounds{px(7), px(6), bounds.right - px(7), px(25)};
@@ -2111,17 +2301,27 @@ private:
         update_note_command_choices();
         note_command_bounds_ = {};
         int suggestions_height = 0;
+        const bool show_note_undo = !settings_open_ && tab_ == Tab::notes && detail_ == Detail::none &&
+            !tag_picker_open_ && !note_undo_id_.empty() && GetTickCount64() < note_undo_until_;
+        note_command_visible_ = 0;
         if (footer && tab_ == Tab::notes && footer_edit_) {
             const auto value = trim(narrow(edit_text(footer_edit_)));
             if (!value.empty() && value.front() == '/') {
-                suggestions_height = px(note_command_choices_.empty() ? 49 : 10 + 29 * static_cast<int>(note_command_choices_.size()));
+                const int available = std::max(px(39), height - top - px(44) - px(80) - (show_note_undo ? px(30) : 0));
+                note_command_visible_ = std::min(note_command_choices_.size(),
+                    static_cast<std::size_t>(std::max(1, (available - px(10)) / px(29))));
+                if (note_command_selection_ < note_command_first_) note_command_first_ = note_command_selection_;
+                if (note_command_visible_ && note_command_selection_ >= note_command_first_ + note_command_visible_)
+                    note_command_first_ = note_command_selection_ - note_command_visible_ + 1;
+                note_command_first_ = std::min(note_command_first_, note_command_choices_.size() - note_command_visible_);
+                suggestions_height = note_command_choices_.empty() ? std::min(px(49), available) :
+                    px(10 + 29 * static_cast<int>(note_command_visible_));
                 note_command_bounds_ = RECT{px(12), height - px(44) - suggestions_height, width - px(12), height - px(47)};
             }
         }
         int bottom = footer ? px(44) + suggestions_height : px(12);
         note_undo_bounds_ = {};
-        if (!settings_open_ && tab_ == Tab::notes && detail_ == Detail::none &&
-            !tag_picker_open_ && !note_undo_id_.empty() && GetTickCount64() < note_undo_until_) {
+        if (show_note_undo) {
             const int undo_top = height - bottom - px(28);
             note_undo_bounds_ = RECT{px(12), undo_top, width - px(12), undo_top + px(24)};
             const auto id = note_undo_id_;
@@ -2140,6 +2340,8 @@ private:
             ShowWindow(footer_edit_, SW_SHOW);
         } else if (footer_edit_) ShowWindow(footer_edit_, SW_HIDE);
         if (note_query_edit_) ShowWindow(note_query_edit_, note_page_visible() ? SW_SHOW : SW_HIDE);
+        if (note_find_edit_) ShowWindow(note_find_edit_, !settings_open_ && detail_ == Detail::note &&
+            !note_metadata_open_ && !tag_picker_open_ && note_find_open_ ? SW_SHOW : SW_HIDE);
         if (settings_open_) {
             for (HWND edit : {title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_,
                               tag_query_edit_, composer_edit_}) if (edit) ShowWindow(edit, SW_HIDE);
@@ -2151,12 +2353,12 @@ private:
         else if (tag_picker_open_) { content_height_ = area.bottom; layout_tag_picker(area); }
         else layout_cards(area);
         if (suggestions_height && !note_command_choices_.empty()) {
-            for (std::size_t i = 0; i < note_command_choices_.size(); ++i) {
+            for (std::size_t i = note_command_first_; i < note_command_first_ + note_command_visible_; ++i) {
                 const auto page = note_command_choices_[i];
                 const auto label = widen(note_command_name(page)) + note_command_description(page);
                 button("note-command:" + std::string(note_command_name(page)), window_, label,
-                    rect(note_command_bounds_.left + px(4), note_command_bounds_.top + px(4) + static_cast<int>(i) * px(29),
-                         note_command_bounds_.right - note_command_bounds_.left - px(8), px(23)),
+                    rect(note_command_bounds_.left + px(4), note_command_bounds_.top + px(4) + static_cast<int>(i - note_command_first_) * px(29),
+                         note_command_bounds_.right - note_command_bounds_.left - px(10), px(23)),
                     [this, page] {
                         const auto value = trim(narrow(edit_text(footer_edit_)));
                         const auto split = value.find_first_of(" \t");
@@ -2300,30 +2502,34 @@ private:
         update_note_results();
         button("note-command-back", content_, L"< BACK", rect(0, px(2), px(64), px(22)), [this] { close_note_page(); });
         MoveWindow(note_query_edit_, px(5), px(39), area.right - px(10), px(22), FALSE);
-        note_result_rows_ = std::max(1, (static_cast<int>(area.bottom) - px(131)) / px(58));
+        const int row_height = px(note_page_ == NotePage::search ? 74 : 58);
+        note_result_rows_ = std::max(1, (static_cast<int>(area.bottom) - px(131)) / row_height);
         note_result_offset_ = std::clamp(note_result_offset_, 0,
             std::max(0, static_cast<int>(note_results_.size()) - note_result_rows_));
-        note_results_bounds_ = RECT{0, px(96), area.right, px(96) + note_result_rows_ * px(58) - px(8)};
+        note_results_bounds_ = RECT{0, px(96), area.right, px(96) + note_result_rows_ * row_height - px(8)};
         const int end = std::min(static_cast<int>(note_results_.size()), note_result_offset_ + note_result_rows_);
         for (int i = note_result_offset_; i < end; ++i) {
             const auto item = note_results_[static_cast<std::size_t>(i)];
-            const auto id = get_string(item, "id");
+            const auto id = note_result_id(item);
             const auto label = (note_page_ == NotePage::remove ? L"DELETE " :
                 note_page_ == NotePage::trash ? L"RESTORE " : L"") + widen(get_string(item, "title"));
-            const int row_top = note_results_bounds_.top + (i - note_result_offset_) * px(58);
+            const int row_top = note_results_bounds_.top + (i - note_result_offset_) * row_height;
             const int action_width = note_page_ == NotePage::trash ? px(115) : 0;
             button("note-result:" + id, content_, label,
-                rect(0, row_top, area.right - px(8) - action_width, px(50)),
+                rect(0, row_top, area.right - px(8) - action_width, row_height - px(8)),
                 [this, item] { activate_note_result(item); }, true, false, id == note_selected_id_, item);
             if (note_page_ == NotePage::trash)
                 button("note-purge:" + id, content_, L"DELETE FOREVER",
                        rect(area.right - px(117), row_top, px(109), px(50)), [this, item] { purge_note(item); });
         }
-        if (static_cast<int>(note_results_.size()) > note_result_rows_) {
+        if (static_cast<int>(note_results_.size()) > note_result_rows_ ||
+            (note_page_ == NotePage::search && (note_search_page_offset_ || note_search_next_))) {
             button("note-page-up", content_, L"UP", rect(area.right - px(110), area.bottom - px(24), px(45), px(22)),
-                [this] { scroll_note_results(-note_result_rows_); }, note_result_offset_ > 0);
+                [this] { scroll_note_results(-note_result_rows_); }, note_result_offset_ > 0 ||
+                    (note_page_ == NotePage::search && note_search_page_offset_));
             button("note-page-down", content_, L"DOWN", rect(area.right - px(58), area.bottom - px(24), px(58), px(22)),
-                [this] { scroll_note_results(note_result_rows_); }, end < static_cast<int>(note_results_.size()));
+                [this] { scroll_note_results(note_result_rows_); }, end < static_cast<int>(note_results_.size()) ||
+                    (note_page_ == NotePage::search && note_search_next_.has_value()));
         }
     }
     void layout_detail(RECT area) {
@@ -2384,7 +2590,18 @@ private:
         }
         const auto& composer_images = composer_draft().images;
         const int attachments = composer_images.empty() ? 0 : px(55);
-        note_history_bounds_ = RECT{0, px(35), area.right, std::max(px(88), static_cast<int>(area.bottom) - px(94) - attachments)};
+        if (note_find_open_) {
+            MoveWindow(note_find_edit_, px(5), px(41), area.right - px(147), px(22), FALSE);
+            button("note-find-prev", content_, L"PREV", rect(area.right - px(135), px(40), px(42), px(24)),
+                   [this] { move_note_find(-1); }, !note_find_results_.empty());
+            button("note-find-next", content_, L"NEXT", rect(area.right - px(89), px(40), px(42), px(24)),
+                   [this] { move_note_find(1); }, !note_find_results_.empty());
+            button("note-find-close", content_, L"DONE", rect(area.right - px(43), px(40), px(43), px(24)),
+                   [this] { close_note_find(); });
+        }
+        const int history_top = px(note_find_open_ ? 93 : 35);
+        note_history_bounds_ = RECT{0, history_top, area.right,
+            std::max(history_top + px(35), static_cast<int>(area.bottom) - px(94) - attachments)};
         note_composer_bounds_ = RECT{0, note_history_bounds_.bottom + px(8) + attachments, area.right, area.bottom - px(29)};
         note_attachment_bounds_ = RECT{0, note_history_bounds_.bottom + px(8), area.right, note_history_bounds_.bottom + px(55)};
         MoveWindow(composer_edit_, px(5), note_composer_bounds_.top + px(5), area.right - px(16),
@@ -2570,6 +2787,14 @@ private:
                 auto bounds = note_command_bounds_;
                 InflateRect(&bounds, -px(8), -px(6));
                 text(dc, L"No matching command.\nType / to see the available commands.", bounds, small_font_, muted);
+            } else if (note_command_visible_ < note_command_choices_.size()) {
+                const int height = note_command_bounds_.bottom - note_command_bounds_.top - px(8);
+                const int thumb = std::max(px(8), height * static_cast<int>(note_command_visible_) /
+                    static_cast<int>(note_command_choices_.size()));
+                const int top = note_command_bounds_.top + px(4) + (height - thumb) * static_cast<int>(note_command_first_) /
+                    static_cast<int>(note_command_choices_.size() - note_command_visible_);
+                fill(dc, RECT{note_command_bounds_.right - px(4), top,
+                    note_command_bounds_.right - px(4) + std::max(1, px(1)), top + thumb}, muted);
             }
         }
         if (note_undo_bounds_.bottom > note_undo_bounds_.top) {
@@ -2619,17 +2844,27 @@ private:
             body_font_, foreground, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         outline(dc, RECT{0, px(35), area.right, px(65)}, border);
         text(dc, note_page_ == NotePage::remove ? L"Click a note to move it to Trash." :
-            note_page_ == NotePage::trash ? L"Restore, or delete forever." : L"Search names. Enter opens a note.",
+            note_page_ == NotePage::trash ? L"Restore, or delete forever." :
+            note_page_ == NotePage::search ? L"Search entries. Enter jumps to a match." : L"Search names. Enter opens a note.",
             RECT{0, px(72), area.right - px(94), px(89)}, small_font_, note_page_ == NotePage::remove ? orange : muted,
             DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        text(dc, std::to_wstring(note_results_.size()) + (note_results_.size() == 1 ? L" match" : L" matches"),
+        const auto total_results = note_page_ == NotePage::search ? note_search_total_ : note_results_.size();
+        text(dc, note_search_pending_ && note_page_ == NotePage::search ? L"Searching..." :
+            std::to_wstring(total_results) + (total_results == 1 ? L" match" : L" matches"),
             RECT{area.right - px(88), px(72), area.right, px(89)}, small_font_, muted,
             DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
         if (note_results_.empty()) {
             const bool empty = snapshot_.value(note_page_ == NotePage::trash ? "trash" : "notes", Json::array()).empty();
-            text(dc, empty ? (note_page_ == NotePage::trash ? L"Trash is empty." : L"No notes yet.") : L"No matching notes.",
+            const bool searching = note_page_ == NotePage::search;
+            const bool blank = searching && edit_text(note_query_edit_).empty();
+            const auto heading = searching && note_search_pending_ ? L"Searching your entries..." :
+                blank ? L"Find something you wrote." :
+                empty ? (note_page_ == NotePage::trash ? L"Trash is empty." : L"No notes yet.") :
+                searching ? L"No matching entries." : L"No matching notes.";
+            text(dc, heading,
                 RECT{px(8), px(115), area.right - px(8), px(142)}, title_font_);
-            text(dc, empty ? (note_page_ == NotePage::trash ? L"Deleted notes stay here until their retention period ends." :
+            text(dc, searching ? L"Type a word, phrase, or part of a link." :
+                empty ? (note_page_ == NotePage::trash ? L"Deleted notes stay here until their retention period ends." :
                 L"Go back to create a note.") : L"Try another part of the name.",
                 RECT{px(8), px(147), area.right - px(8), px(188)}, body_font_, muted);
         }
@@ -2639,9 +2874,12 @@ private:
             const int thumb = std::max(px(20), height * note_result_rows_ / total);
             const int top = note_results_bounds_.top + (height - thumb) * note_result_offset_ / (total - note_result_rows_);
             fill(dc, RECT{area.right - std::max(1, px(1)), top, area.right, top + thumb}, border);
-            const auto first = std::to_wstring(note_result_offset_ + 1);
-            const auto last = std::to_wstring(std::min(total, note_result_offset_ + note_result_rows_));
-            text(dc, first + L" - " + last + L" of " + std::to_wstring(total),
+        }
+        if (total_results > static_cast<std::size_t>(note_result_rows_)) {
+            const auto start = note_page_ == NotePage::search ? note_search_page_offset_ : 0;
+            const auto first = std::to_wstring(start + note_result_offset_ + 1);
+            const auto last = std::to_wstring(start + std::min(static_cast<int>(note_results_.size()), note_result_offset_ + note_result_rows_));
+            text(dc, first + L" - " + last + L" of " + std::to_wstring(total_results),
                 RECT{0, area.bottom - px(24), area.right - px(123), area.bottom - px(2)}, small_font_, subdued,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
@@ -2726,12 +2964,24 @@ private:
             draw_editor_scroll(dc, body_edit_);
             return;
         }
+        if (note_find_open_) {
+            outline(dc, RECT{0, px(37), area.right - px(142), px(66)}, border);
+            const auto status = note_find_pending_ ? L"Searching..." : edit_text(note_find_edit_).empty() ? L"Find text in this note" :
+                note_find_results_.empty() ? L"No matching entries" :
+                std::to_wstring(note_find_selection_ + 1) + L" / " + std::to_wstring(note_find_results_.size()) + L" matching entries";
+            text(dc, status, RECT{px(3), px(71), area.right - px(3), px(88)}, small_font_, muted,
+                 DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
         const int saved = SaveDC(dc);
         IntersectClipRect(dc, note_history_bounds_.left, note_history_bounds_.top, note_history_bounds_.right, note_history_bounds_.bottom);
         for (const auto& row : note_rows_) {
             int y = note_history_bounds_.top + row.top - note_scroll_;
             if (y + row.height < note_history_bounds_.top || y > note_history_bounds_.bottom) continue;
             const auto& entry = note_messages_[row.index];
+            if (get_string(entry, "id") == note_highlight_id_ && GetTickCount64() < note_highlight_until_) {
+                fill(dc, RECT{px(3), y - px(3), area.right - px(5), y + row.height - px(5)}, top_background);
+                fill(dc, RECT{px(3), y - px(3), px(5), y + row.height - px(5)}, muted);
+            }
             text(dc, L">", rect(px(8), y, px(12), px(16)), body_font_, orange, DT_SINGLELINE);
             text(dc, entry.contains("edited_at") ? L"me · edited" : L"me",
                  rect(px(25), y, px(105), px(16)), small_font_, muted, DT_SINGLELINE | DT_VCENTER);
@@ -2864,6 +3114,7 @@ private:
         if (settings_open_) settings_back();
         else if (tag_picker_open_) close_tag_picker();
         else if (detail_ == Detail::note && note_metadata_open_) open_note_metadata();
+        else if (detail_ == Detail::note && note_find_open_) close_note_find();
         else if (detail_ == Detail::note && note_edit_) cancel_note_message_edit();
         else if (reply_edit_ && tab_ == Tab::notifications) cancel_reply();
         else if (detail_ != Detail::none) leave_detail();
@@ -2873,6 +3124,14 @@ private:
     void changed(const Json& event) {
         snapshot_ = store_.snapshot();
         update_busy_mode();
+        const auto operation = get_string(event, "operation");
+        if (operation.starts_with("note.")) note_results_dirty_ = true;
+        if (!note_undo_id_.empty()) {
+            const auto trash = snapshot_.value("trash", Json::array());
+            if (std::none_of(trash.begin(), trash.end(), [this](const auto& note) {
+                    return get_string(note, "id") == note_undo_id_;
+                })) note_undo_id_.clear();
+        }
         bool follow_note = false;
         if (detail_ != Detail::none) {
             const auto& records = snapshot_[detail_ == Detail::task ? "tasks" : "notes"];
@@ -2882,10 +3141,12 @@ private:
             if (current != records.end() && detail_ == Detail::note) {
                 detail_tags_ = tags_of(*current);
                 if (get_string(event, "id") == detail_id_ && get_string(event, "operation").starts_with("note.")) {
-                    follow_note = get_string(event, "operation") == "note.append" && note_scroll_limit() - note_scroll_ <= px(24);
+                    follow_note = get_string(event, "operation") == "note.append" && !note_find_open_ &&
+                        note_scroll_limit() - note_scroll_ <= px(24);
                     const auto count = current->value("message_count", std::size_t(0));
                     if (note_offset_ >= count) note_offset_ = count > 100 ? count - 100 : 0;
                     load_note_history();
+                    if (note_find_open_ && !note_find_pending_) refresh_note_find(false);
                     if (note_metadata_open_ && !detail_dirty_) {
                         populating_ = true;
                         auto title = widen(get_string(note_record_, "title"));
@@ -2951,6 +3212,23 @@ private:
         if (event == EN_CHANGE && !populating_ && id == 51) {
             note_selected_id_.clear();
             note_result_offset_ = 0;
+            note_search_page_offset_ = 0;
+            note_results_dirty_ = true;
+            if (note_page_ == NotePage::search) {
+                note_results_.clear();
+                note_search_total_ = 0;
+                note_search_next_.reset();
+                note_search_pending_ = true;
+                SetTimer(window_, 6, 150, nullptr);
+            }
+            layout();
+        }
+        if (event == EN_CHANGE && !populating_ && id == 52) {
+            note_find_pending_ = true;
+            note_find_results_.clear();
+            note_find_selection_ = 0;
+            note_highlight_id_.clear();
+            SetTimer(window_, 6, 150, nullptr);
             layout();
         }
         return 0;
@@ -2981,13 +3259,19 @@ private:
             wheel_remainder_ += GET_WHEEL_DELTA_WPARAM(wparam);
             int steps = wheel_remainder_ / WHEEL_DELTA;
             wheel_remainder_ %= WHEEL_DELTA;
-            if (tag_picker_open_) scroll_tags(-steps * 2);
+            if (GetFocus() == footer_edit_ && !note_command_choices_.empty() && steps) {
+                const int count = static_cast<int>(note_command_choices_.size());
+                note_command_selection_ = static_cast<std::size_t>(std::clamp(static_cast<int>(note_command_selection_) - steps, 0, count - 1));
+                layout();
+            }
+            else if (tag_picker_open_) scroll_tags(-steps * 2);
             else if (note_page_visible()) scroll_note_results(-steps * 3);
             else scroll_by(-steps * px(48));
             return 0;
         }
         if (message == WM_KEYDOWN) {
             if (wparam == VK_ESCAPE) { escape(); return 0; }
+            if (note_keys(target, wparam)) return 0;
             if (note_page_visible() && GetKeyState(VK_CONTROL) < 0 && (wparam == VK_HOME || wparam == VK_END)) {
                 scroll_note_results(wparam == VK_HOME ? -static_cast<int>(note_results_.size()) : static_cast<int>(note_results_.size()));
                 return 0;
@@ -3128,6 +3412,10 @@ private:
                     note_undo_id_.clear();
                     layout();
                 }
+                if (!note_highlight_id_.empty() && GetTickCount64() >= note_highlight_until_) {
+                    note_highlight_id_.clear();
+                    InvalidateRect(content_, nullptr, FALSE);
+                }
                 if (active_banner_ && GetTickCount64() - banner_started_ > 60000) next_banner();
                 if (!feedback_.empty() && GetTickCount64() >= feedback_until_) {
                     feedback_.clear(); InvalidateRect(content_, nullptr, FALSE);
@@ -3139,6 +3427,16 @@ private:
                 if (redraw) InvalidateRect(content_, nullptr, FALSE);
             } else if (wparam == 3) { KillTimer(window_, 3); save_detail(SaveIntent::background); }
             else if (wparam == 4) { KillTimer(window_, 4); save_note_draft(); }
+            else if (wparam == 6) {
+                KillTimer(window_, 6);
+                if (note_find_pending_ && note_find_open_)
+                    refresh_note_find(!settings_open_ && !note_metadata_open_ && !tag_picker_open_);
+                if (note_search_pending_) {
+                    note_search_pending_ = false;
+                    note_results_dirty_ = true;
+                    layout();
+                }
+            }
             return 0;
         case WM_CLOSE: hide(); return 0;
         case WM_QUERYENDSESSION: return save_detail() ? TRUE : FALSE;
@@ -3155,7 +3453,7 @@ private:
             data.hWnd = window_;
             data.uID = 1;
             Shell_NotifyIconW(NIM_DELETE, &data);
-            KillTimer(window_, 1); KillTimer(window_, 2); KillTimer(window_, 3); KillTimer(window_, 4);
+            KillTimer(window_, 1); KillTimer(window_, 2); KillTimer(window_, 3); KillTimer(window_, 4); KillTimer(window_, 6);
             PostQuitMessage(0);
             return 0;
         }
@@ -3185,7 +3483,7 @@ private:
     static LRESULT CALLBACK edit_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data) {
         auto* app = reinterpret_cast<App*>(data);
         if (message == WM_CONTEXTMENU) { app->app_context_menu(window, lparam); return 0; }
-        if (message == WM_MOUSEWHEEL && window == app->note_query_edit_)
+        if (message == WM_MOUSEWHEEL && (window == app->note_query_edit_ || window == app->note_find_edit_))
             return SendMessageW(app->window_, message, wparam, lparam);
         if (message == WM_PASTE && window == app->composer_edit_ && app->paste_note_attachment()) return 0;
         if (message == WM_CHAR && wparam == 0x16 && window == app->composer_edit_) {
@@ -3215,9 +3513,11 @@ private:
         }
         if (message == WM_CHAR && (wparam == VK_ESCAPE || (wparam == VK_RETURN &&
             (window == app->footer_edit_ || window == app->tag_query_edit_ || window == app->note_query_edit_ ||
+             window == app->note_find_edit_ ||
              window == app->settings_width_edit_ || window == app->settings_height_edit_ || GetKeyState(VK_CONTROL) < 0 ||
              window == app->settings_retention_edit_ ||
              (window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0))))) return 0;
+        if (message == WM_CHAR && wparam == 0x06 && app->detail_ == Detail::note) return 0;
         return DefSubclassProc(window, message, wparam, lparam);
     }
     static LRESULT CALLBACK button_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR data) {
