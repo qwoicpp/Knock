@@ -218,7 +218,7 @@ private:
     enum class Detail { none, task, note };
     enum class SaveIntent { explicit_action, background };
     enum class SettingsPage { general, preferences, replies, reply };
-    enum class NotePage { list, find, remove };
+    enum class NotePage { list, find, remove, trash };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
         HWND handle = nullptr;
@@ -304,6 +304,10 @@ private:
     std::size_t note_command_selection_ = 0;
     RECT note_command_bounds_{};
     ULONGLONG note_delete_click_until_ = 0;
+    std::string note_undo_id_;
+    std::string note_undo_title_;
+    ULONGLONG note_undo_until_ = 0;
+    RECT note_undo_bounds_{};
     bool note_metadata_open_ = false;
     bool note_draft_dirty_ = false;
     NoteDraft note_draft_;
@@ -1037,9 +1041,16 @@ private:
         SetFocus(note_page_visible() ? note_query_edit_ : window_);
     }
     void delete_detail() {
-        auto text = detail_ == Detail::note ? L"Delete this note?" : L"Delete this task?";
+        if (detail_ == Detail::note) {
+            if (!save_note_draft() || !trash_note(note_record_)) return;
+            detail_dirty_ = false;
+            detail_ = Detail::none;
+            destroy_detail_edits();
+            layout();
+            return;
+        }
         context_menu_ = true;
-        int response = MessageBoxW(window_, text, L"Knock", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        int response = MessageBoxW(window_, L"Delete this task?", L"Knock", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
         context_menu_ = false;
         if (response != IDYES) return;
         auto result = mutate({{"op", detail_ == Detail::note ? "note.delete" : "task.delete"}, {"id", detail_id_}});
@@ -1079,7 +1090,53 @@ private:
         return !settings_open_ && tab_ == Tab::notes && detail_ == Detail::none && note_page_ != NotePage::list;
     }
     static const char* note_command_name(NotePage page) {
-        return page == NotePage::remove ? "/delete-note" : "/find-note";
+        switch (page) {
+        case NotePage::remove: return "/delete-note";
+        case NotePage::trash: return "/trash";
+        default: return "/find-note";
+        }
+    }
+    static const wchar_t* note_command_description(NotePage page) {
+        switch (page) {
+        case NotePage::remove: return L"  Delete notes with a click";
+        case NotePage::trash: return L"  Restore deleted notes";
+        default: return L"  Find a note by name";
+        }
+    }
+    bool trash_note(const Json& note) {
+        const auto id = get_string(note, "id");
+        if (!mutate({{"op", "note.delete"}, {"id", id}}).value("ok", false)) return false;
+        note_undo_id_ = id;
+        note_undo_title_ = get_string(note, "title");
+        note_undo_until_ = GetTickCount64() + 10000;
+        snapshot_ = store_.snapshot();
+        return true;
+    }
+    void restore_note(const std::string& id) {
+        if (!mutate({{"op", "note.restore"}, {"id", id}}).value("ok", false)) return;
+        if (note_undo_id_ == id) note_undo_id_.clear();
+        snapshot_ = store_.snapshot();
+        feedback(L"Note restored.");
+        layout();
+        SetFocus(note_page_visible() ? note_query_edit_ : window_);
+    }
+    void purge_note(const Json& note) {
+        if (GetTickCount64() < note_delete_click_until_) return;
+        const bool previous_menu = context_menu_;
+        context_menu_ = true;
+        const auto question = L"Permanently delete \"" + widen(get_string(note, "title")) +
+            L"\"?\nThis cannot be undone.";
+        const int answer = MessageBoxW(window_, question.c_str(), L"Knock", MB_YESNO | MB_DEFBUTTON2);
+        context_menu_ = previous_menu;
+        if (answer != IDYES) return;
+        const auto id = get_string(note, "id");
+        if (!mutate({{"op", "note.purge"}, {"id", id}}).value("ok", false)) return;
+        if (note_undo_id_ == id) note_undo_id_.clear();
+        note_delete_click_until_ = GetTickCount64() + GetDoubleClickTime();
+        snapshot_ = store_.snapshot();
+        feedback(L"Note permanently deleted.");
+        layout();
+        SetFocus(note_query_edit_);
     }
     void open_note_page(NotePage page, const std::string& query = {}) {
         if (!save_detail()) return;
@@ -1111,14 +1168,14 @@ private:
         const auto split = value.find_first_of(" \t");
         const auto name = tag_key(value.substr(0, split));
         const auto query = split == std::string::npos ? std::string() : trim(value.substr(split + 1));
-        for (NotePage page : {NotePage::find, NotePage::remove}) {
+        for (NotePage page : {NotePage::find, NotePage::remove, NotePage::trash}) {
             if (name == note_command_name(page)) { open_note_page(page, query); return; }
         }
         if (split == std::string::npos && !note_command_choices_.empty()) {
             open_note_page(note_command_choices_[note_command_selection_]);
             return;
         }
-        feedback(L"Unknown note command. Use /find-note or /delete-note.");
+        feedback(L"Unknown note command. Type / to see the available commands.");
         SetFocus(footer_edit_);
     }
     void update_note_command_choices() {
@@ -1128,7 +1185,7 @@ private:
         if (value.empty() || value.front() != '/') return;
         const auto split = value.find_first_of(" \t");
         const auto prefix = value.substr(0, split);
-        for (NotePage page : {NotePage::find, NotePage::remove})
+        for (NotePage page : {NotePage::find, NotePage::remove, NotePage::trash})
             if (std::string(note_command_name(page)).starts_with(prefix)) note_command_choices_.push_back(page);
         note_command_selection_ = std::min(note_command_selection_, note_command_choices_.empty() ? 0 : note_command_choices_.size() - 1);
     }
@@ -1136,7 +1193,8 @@ private:
         const auto query = widen(trim(narrow(edit_text(note_query_edit_))));
         struct Match { Json item; int rank; };
         std::vector<Match> matches;
-        for (const auto& item : snapshot_["notes"]) {
+        const auto records = snapshot_.value(note_page_ == NotePage::trash ? "trash" : "notes", Json::array());
+        for (const auto& item : records) {
             const auto name = widen(get_string(item, "title"));
             const int position = query.empty() ? 0 : FindStringOrdinal(FIND_FROMSTART,
                 name.c_str(), static_cast<int>(name.size()), query.c_str(), static_cast<int>(query.size()), TRUE);
@@ -1179,12 +1237,16 @@ private:
             begin_detail(Detail::note, item);
             return;
         }
+        if (note_page_ == NotePage::trash) {
+            if (GetTickCount64() < note_delete_click_until_) return;
+            restore_note(id);
+            note_delete_click_until_ = GetTickCount64() + GetDoubleClickTime();
+            return;
+        }
         if (note_page_ != NotePage::remove || GetTickCount64() < note_delete_click_until_) return;
-        if (!mutate({{"op", "note.delete"}, {"id", id}}).value("ok", false)) return;
+        if (!trash_note(item)) return;
         // Rows move after deletion; ignore the second half of a double-click.
         note_delete_click_until_ = GetTickCount64() + GetDoubleClickTime();
-        snapshot_ = store_.snapshot();
-        feedback(L"Deleted " + widen(get_string(item, "title")) + L".");
         layout();
         SetFocus(note_query_edit_);
     }
@@ -1836,10 +1898,12 @@ private:
             text(item.hDC, widen(get_string(button.record, "title")),
                 RECT{px(8), px(6), bounds.right - px(65), px(24)}, body_font_, foreground,
                 DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            text(item.hDC, deleting ? L"DELETE" : L"OPEN",
+            text(item.hDC, deleting ? L"DELETE" : note_page_ == NotePage::trash ? L"RESTORE" : L"OPEN",
                 RECT{bounds.right - px(61), px(6), bounds.right - px(8), px(24)}, small_font_, deleting ? orange : muted,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-            auto caption = tag_caption(tags_of(button.record));
+            auto caption = note_page_ == NotePage::trash ?
+                L"Deleted " + display_time(button.record.value("deleted_at", std::int64_t(0))) :
+                tag_caption(tags_of(button.record));
             if (caption.empty()) caption = L"Untagged";
             text(item.hDC, caption, RECT{px(8), px(28), bounds.right - px(8), bounds.bottom - px(5)},
                 small_font_, muted, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1948,6 +2012,16 @@ private:
             }
         }
         int bottom = footer ? px(44) + suggestions_height : px(12);
+        note_undo_bounds_ = {};
+        if (!settings_open_ && tab_ == Tab::notes && detail_ == Detail::none &&
+            !tag_picker_open_ && !note_undo_id_.empty() && GetTickCount64() < note_undo_until_) {
+            const int undo_top = height - bottom - px(28);
+            note_undo_bounds_ = RECT{px(12), undo_top, width - px(12), undo_top + px(24)};
+            const auto id = note_undo_id_;
+            button("note-undo", window_, L"UNDO", rect(width - px(66), undo_top, px(54), px(23)),
+                   [this, id] { restore_note(id); });
+            bottom += px(30);
+        }
         MoveWindow(content_, px(12), top, width - px(24), std::max(px(80), height - top - bottom), FALSE);
         RECT area{};
         GetClientRect(content_, &area);
@@ -1972,8 +2046,7 @@ private:
         if (suggestions_height && !note_command_choices_.empty()) {
             for (std::size_t i = 0; i < note_command_choices_.size(); ++i) {
                 const auto page = note_command_choices_[i];
-                const auto label = widen(note_command_name(page)) +
-                    (page == NotePage::find ? L"  Find a note by name" : L"  Delete notes with a click");
+                const auto label = widen(note_command_name(page)) + note_command_description(page);
                 button("note-command:" + std::string(note_command_name(page)), window_, label,
                     rect(note_command_bounds_.left + px(4), note_command_bounds_.top + px(4) + static_cast<int>(i) * px(29),
                          note_command_bounds_.right - note_command_bounds_.left - px(8), px(23)),
@@ -2128,10 +2201,16 @@ private:
         for (int i = note_result_offset_; i < end; ++i) {
             const auto item = note_results_[static_cast<std::size_t>(i)];
             const auto id = get_string(item, "id");
-            const auto label = (note_page_ == NotePage::remove ? L"DELETE " : L"") + widen(get_string(item, "title"));
+            const auto label = (note_page_ == NotePage::remove ? L"DELETE " :
+                note_page_ == NotePage::trash ? L"RESTORE " : L"") + widen(get_string(item, "title"));
+            const int row_top = note_results_bounds_.top + (i - note_result_offset_) * px(58);
+            const int action_width = note_page_ == NotePage::trash ? px(115) : 0;
             button("note-result:" + id, content_, label,
-                rect(0, note_results_bounds_.top + (i - note_result_offset_) * px(58), area.right - px(8), px(50)),
+                rect(0, row_top, area.right - px(8) - action_width, px(50)),
                 [this, item] { activate_note_result(item); }, true, false, id == note_selected_id_, item);
+            if (note_page_ == NotePage::trash)
+                button("note-purge:" + id, content_, L"DELETE FOREVER",
+                       rect(area.right - px(117), row_top, px(109), px(50)), [this, item] { purge_note(item); });
         }
         if (static_cast<int>(note_results_.size()) > note_result_rows_) {
             button("note-page-up", content_, L"UP", rect(area.right - px(110), area.bottom - px(24), px(45), px(22)),
@@ -2377,8 +2456,14 @@ private:
             if (note_command_choices_.empty()) {
                 auto bounds = note_command_bounds_;
                 InflateRect(&bounds, -px(8), -px(6));
-                text(dc, L"No matching command.\nTry /find-note or /delete-note.", bounds, small_font_, muted);
+                text(dc, L"No matching command.\nType / to see the available commands.", bounds, small_font_, muted);
             }
+        }
+        if (note_undo_bounds_.bottom > note_undo_bounds_.top) {
+            auto bounds = note_undo_bounds_;
+            bounds.right -= px(63);
+            text(dc, L"Deleted \"" + widen(note_undo_title_) + L"\"", bounds, small_font_, muted,
+                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
     void draw_content(HDC dc) {
@@ -2420,17 +2505,19 @@ private:
         text(dc, widen(note_command_name(note_page_)), RECT{px(77), px(2), area.right, px(24)},
             body_font_, foreground, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         outline(dc, RECT{0, px(35), area.right, px(65)}, border);
-        text(dc, note_page_ == NotePage::remove ? L"Click a note to delete it." : L"Search names. Enter opens a note.",
+        text(dc, note_page_ == NotePage::remove ? L"Click a note to move it to Trash." :
+            note_page_ == NotePage::trash ? L"Restore, or delete forever." : L"Search names. Enter opens a note.",
             RECT{0, px(72), area.right - px(94), px(89)}, small_font_, note_page_ == NotePage::remove ? orange : muted,
             DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         text(dc, std::to_wstring(note_results_.size()) + (note_results_.size() == 1 ? L" match" : L" matches"),
             RECT{area.right - px(88), px(72), area.right, px(89)}, small_font_, muted,
             DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
         if (note_results_.empty()) {
-            const bool empty = snapshot_["notes"].empty();
-            text(dc, empty ? L"No notes yet." : L"No matching notes.",
+            const bool empty = snapshot_.value(note_page_ == NotePage::trash ? "trash" : "notes", Json::array()).empty();
+            text(dc, empty ? (note_page_ == NotePage::trash ? L"Trash is empty." : L"No notes yet.") : L"No matching notes.",
                 RECT{px(8), px(115), area.right - px(8), px(142)}, title_font_);
-            text(dc, empty ? L"Go back to create a note." : L"Try another part of the name.",
+            text(dc, empty ? (note_page_ == NotePage::trash ? L"Deleted notes stay here until their retention period ends." :
+                L"Go back to create a note.") : L"Try another part of the name.",
                 RECT{px(8), px(147), area.right - px(8), px(188)}, body_font_, muted);
         }
         if (static_cast<int>(note_results_.size()) > note_result_rows_) {
@@ -2920,6 +3007,10 @@ private:
                 if (busy() && IsWindowVisible(window_)) {
                     InvalidateRect(window_, nullptr, FALSE);
                     if (settings_open_) InvalidateRect(content_, nullptr, FALSE);
+                }
+                if (!note_undo_id_.empty() && GetTickCount64() >= note_undo_until_) {
+                    note_undo_id_.clear();
+                    layout();
                 }
                 if (active_banner_ && GetTickCount64() - banner_started_ > 60000) next_banner();
                 if (!feedback_.empty() && GetTickCount64() >= feedback_until_) {
