@@ -111,7 +111,11 @@ HWND button(HWND root, const wchar_t* caption) {
 
 void click(HWND control) {
     require(IsWindowEnabled(control), "Cannot click a disabled control");
-    message(control, BM_CLICK);
+    const auto caption = knock::narrow(window_text(control));
+    try { message(control, BM_CLICK); }
+    catch (const std::exception& error) {
+        throw std::runtime_error(std::string(error.what()) + "; button: " + caption);
+    }
 }
 
 void enter(HWND control) {

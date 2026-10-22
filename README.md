@@ -20,11 +20,21 @@ not. I'll keep changing it as I use it.
 
 ![A personal note conversation](docs/screenshots/note-conversation.png)
 
-![Finding a note by its title](docs/screenshots/note-find.png)
+<details>
+<summary>A few more screens</summary>
 
-![The Settings page](docs/screenshots/settings.png)
+![Picking a saved reply and changing it before sending](docs/screenshots/saved-replies.png)
 
-These use sample records. Your own install starts empty.
+![Editing an entry in a personal note](docs/screenshots/note-entry-edit.png)
+
+![Restoring a deleted note from Trash](docs/screenshots/note-trash.png)
+
+![Preferences at the smallest window size](docs/screenshots/preferences.png)
+
+</details>
+
+These are captures of the Windows build running under Wine, using sample
+records. Your own install starts empty.
 
 ## Using it
 
@@ -88,7 +98,7 @@ takes a couple of commands:
   Exact titles come first, then titles that start with or contain what you
   typed. Click a result or select it with the arrow keys and press **Enter**.
 - **`/delete-note`** opens a separate list for deleting notes. You can add a
-  search after this command too. Clicking a **DELETE** row deletes that note;
+  search after this command too. Clicking a **DELETE** row moves that note to Trash;
   **Back** takes you out of the list.
 - **`/search-notes words`** searches the text inside your conversations. Results
   show a matching excerpt; opening one takes you straight to that entry.
