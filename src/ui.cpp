@@ -490,23 +490,26 @@ private:
         if (!IsWindowVisible(window_)) keep_open_ = pinned;
         else if (pinned) keep_open_ = true;
         recover_completions();
+        bool title_needs_attention = false;
         if (!focus_id.empty()) {
             if (settings_open_) close_settings();
-            if (!save_detail()) return;
-            detail_ = Detail::none;
-            destroy_detail_edits();
-            tab_ = Tab::notifications;
+            if (!save_detail()) title_needs_attention = true;
+            else {
+                detail_ = Detail::none;
+                destroy_detail_edits();
+                tab_ = Tab::notifications;
+            }
         }
         position_popup();
         layout();
-        if (!focus_id.empty()) {
+        if (!focus_id.empty() && !title_needs_attention) {
             auto found = row_tops_.find(focus_id);
             if (found != row_tops_.end()) scroll() = std::clamp(found->second, 0, std::max(0, content_height_ - viewport_height_));
             layout();
         }
         ShowWindow(window_, SW_SHOWNORMAL);
         SetForegroundWindow(window_);
-        SetFocus(window_);
+        SetFocus(title_needs_attention && title_edit_ ? title_edit_ : window_);
         update_animation();
         InvalidateRect(window_, nullptr, FALSE);
         InvalidateRect(content_, nullptr, FALSE);
