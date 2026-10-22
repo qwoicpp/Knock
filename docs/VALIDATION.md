@@ -1,7 +1,7 @@
 # Validation
 
 The earlier sections retain the original platform and application checks.
-Version-specific additions follow; the latest results are in **Version 0.4**.
+Version-specific additions follow; the latest results are in **Version 0.5**.
 
 ## Windows platform and local IPC
 
@@ -336,3 +336,107 @@ actual Start menu, taskbar, notification delivery/clicks, Explorer restart,
 multi-monitor placement, and display scaling still require the desktop checks
 above. The retained version-0.3 CLI/image/shortcut results describe that release;
 they are not presented as new full-suite runs for version 0.4.
+
+## Version 0.5: inbox preferences and a recoverable notebook
+
+The application and test targets cross-compiled with MinGW-w64 GCC 13, C++20,
+`-Wall -Wextra -Wpedantic`, without warnings. Native Linux CTest passed all
+three registered suites: `store` (31 groups), `window_settings`, and `cli_info`.
+The final Windows `store_tests.exe` also passed all 31 groups under Wine 9.
+
+New storage checks cover GUI-only preference changes, saved-reply validation,
+busy deadlines, full-note Trash/restore, retention and disk-failure rollback,
+and permanent deletion restricted to Trash. Message edits preserve identity,
+chronology, attachment references, and the original append retry token. Tests
+exercise revision conflicts, concurrent edits, invalid payloads, and failed
+saves without losing the prior text.
+
+Search checks cover case-insensitive Unicode text, edited messages, bounded
+response pages, stable message IDs/indexes, and omission of deleted notes.
+The GUI-only in-note operation returns every matching location from a full
+2,000-entry conversation in one scan, including maximum-length message IDs,
+without returning every message body or rewriting state. Public search keeps
+its 100-item page limit.
+
+### Agent instructions
+
+`cli_info` exercises the real parser against platform stubs that fail if help
+or info touches IPC, a data directory, or a GUI service. The real standalone
+Windows CLI was also run under Wine without a tray executable or assets beside
+it: `info` and `get-info` matched the embedded Markdown exactly, help aliases
+matched, and 15 malformed help/info invocations returned JSON errors with exit
+code 5. No app-data directory was created. CMake embeds the distributed guide
+from one source, `docs/AGENT_INSTRUCTIONS.md`.
+
+### Native inbox controls
+
+The new `inbox_ui` suite passed all seven groups against a copy of the final
+Windows application and its assets in a separate Wine prefix and Xvfb desktop:
+
+- IPC cannot change saved replies or the busy timer.
+- Selecting a preset only fills the editor. Editing and sending preserves the
+  exact Unicode answer, leaves the decision custom, and grants no input lease.
+  Incoming requests preserve the current reply editor and focus.
+- Chat-label and menu filtering work, pending requests stay first, and ordinary
+  request expiry continues while notifications are quiet.
+- Saved-reply add/edit/delete/cancel, blank rejection, and retention bounds
+  behave correctly through the actual controls.
+- Settings pages fit at 360 × 360 with an active input lease. Ending busy mode
+  leaves unanswered requests pending.
+- The timer and preferences survive restart.
+- Holding the state file open without delete sharing forces a real save
+  failure at timer completion. The deadline remains persisted, clears after
+  the file is unlocked and the retry runs, remains clear after restart, and
+  never grants permission.
+
+### Native notebook controls
+
+The new `notes_ui` suite passed all 12 groups using actual native menus, edit
+controls, buttons, and IPC reads:
+
+- Click deletion, Undo, and Trash restore retain the same note and message
+  IDs, text, tags, and image references. Permanent deletion requires the
+  explicit confirmation and affects only the selected trashed note.
+- Editing an entry preserves its position and attachments while keeping the
+  unfinished normal composer separately. Revision conflicts retain both the
+  newer stored text and the pending correction. Both drafts survive restart.
+- Up Arrow in an empty composer selects the most recent entry.
+- Unicode content search opens the exact matching old entry. Back preserves
+  the search field and selection. Ctrl+F, Next, and Previous reach entries
+  outside the initially loaded history page.
+- Search and composer controls retain their handles, query, and unsent text
+  through Settings and an incoming appended entry.
+- Content search crosses the 100-result page boundary in both directions.
+- Slash suggestions remain usable at 360 × 360 with busy, input-lease, and
+  Undo strips visible together.
+
+The long-history fixture is seeded through Store before launching the test
+tray; it contains 220 entries and exercises jumps to entries 0 and 120. This
+avoids queuing hundreds of unrelated fixture notifications ahead of the UI
+action being measured. The test suites control only their own spawned process
+and generate no global keyboard or mouse input. They skip if another Knock
+window already exists. The registered Windows tests run serially, with
+60-second and 120-second limits for inbox and notebook checks respectively.
+
+### Rendered checks and limits
+
+Actual captures of the inbox, selected saved reply, note-entry editing, Trash,
+and minimum-size Preferences were inspected and added to the README. Manual
+interaction on the private Wine desktop also opened both consecutive popups
+for right-click → Busy for → 15 minutes, showed the timer, and left the sample
+request pending. This uses the real app controls; it is not a Windows 11 shell
+test. Screenshots contain sample data only.
+
+The older full `ui_tests` regression did not complete reliably in this Wine
+environment. Runs stopped at different native-control/menu actions alongside
+Wine/Linux heap diagnostics (`munmap_chunk(): invalid pointer` and
+`malloc(): unaligned tcache chunk detected`). Its version-0.4 20-group pass
+above remains historical; no complete version-0.5 pass of that older suite is
+claimed. The new inbox and notebook suites and the core suite passed
+independently against the final application.
+
+Native Windows 11 notification display/click behavior, actual taskbar and Start
+menu behavior, Explorer restart, multiple monitors, and high-DPI rendering
+remain the desktop acceptance checks listed above. Existing CLI runner,
+clipboard-image, and shortcut results in earlier sections are retained as
+their original version's evidence, not reported as fresh full-suite runs.
