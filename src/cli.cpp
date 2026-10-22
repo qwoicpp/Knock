@@ -17,6 +17,7 @@ constexpr std::string_view help_text = R"(Knock — a local inbox for your agent
   knock info                         Agent guide and token-saving workflow
   knock open
   knock status
+  knock presence                     Read the manual status and optional message
   knock request --chat AUDIO-1 --message "May I use mouse and keyboard?"
       [--kind input|question] [--timeout 1800] [--lease 300] [--detach]
   knock result REQUEST_ID [--wait SECONDS]
@@ -43,7 +44,9 @@ Repeat --tag for multiple note labels; supplying tags replaces the selection.
 Notes are personal conversations. Add/update --body edits the description;
 append adds a message. Get returns a bounded, oldest-first message page.
 Help and info print text; other commands return one UTF-8 JSON object.
-A request waits without model polling;
+A request waits without model polling. A still-pending request returns immediately
+while Away or Busy (exit 7); keep its ID and continue other work.
+An explicit result --wait still waits for a decision or its time budget.
 --detach returns its ID immediately. A run always detaches and notifies on finish.
 Programs are executed directly. For shell syntax, explicitly use cmd.exe or
 powershell.exe after --. No shell is added by Knock.
@@ -279,6 +282,10 @@ int run_cli(const std::vector<std::wstring>& arguments) {
         parsed.allow({});
         return output(send_command({{"op", "status"}}));
     }
+    if (action == L"presence") {
+        parsed.allow({});
+        return output(send_command({{"op", "presence.get"}}));
+    }
     if (action == L"request") {
         parsed.allow({L"--chat", L"--message", L"--message-file", L"--kind", L"--timeout", L"--lease"}, true);
         const auto chat = parsed.text(L"--chat");
@@ -293,7 +300,8 @@ int run_cli(const std::vector<std::wstring>& arguments) {
                                           {"lease_seconds", parsed.number(L"--lease", 300, 1, 3600)}});
         if (parsed.detach || !result.value("ok", false)) return output(result);
         const auto id = result.at("request").at("id").get<std::string>();
-        auto answer = send_command({{"op", "request.wait"}, {"id", id}, {"wait_seconds", std::min(86400, timeout + 1)}});
+        auto answer = send_command({{"op", "request.wait"}, {"id", id},
+            {"wait_seconds", std::min(86400, timeout + 1)}, {"stop_when_unavailable", true}});
         if (!answer.value("ok", false)) answer["request_id"] = id;
         return output(answer, true);
     }
