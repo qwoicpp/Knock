@@ -73,7 +73,11 @@ HWND edit(HWND root, int id) {
 }
 void click(HWND control) {
     require(IsWindowEnabled(control), "Test action is disabled");
-    message(control, BM_CLICK);
+    const auto label = knock::narrow(caption(control));
+    try { message(control, BM_CLICK); }
+    catch (const std::exception& error) {
+        throw std::runtime_error("Click " + label + ": " + error.what());
+    }
 }
 void set_text(HWND control, const std::wstring& text) {
     message(control, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text.c_str()));
@@ -485,21 +489,34 @@ int main() {
               {"timeout_seconds", 300}, {"lease_seconds", 300}});
         click(button(app.root, L"Notifications"));
         eventually([&] { return buttons(app.root, L"YES").size() == 1; }, "test request appears");
-        click(button(app.root, L"YES"));
+        // These actions remove/rebuild their own controls. Dispatch them on
+        // the UI queue, then verify the resulting state instead of waiting
+        // for a synchronous reply from a destroyed button window.
+        PostMessageW(button(app.root, L"YES"), BM_CLICK, 0, 0);
         eventually([&] { return !snapshot().at("lease").is_null(); }, "input strip appears");
         click(button(app.root, L"Notes"));
         open_settings(app.root);
         set_text(edit(app.root, 41), L"360");
         set_text(edit(app.root, 42), L"360");
-        click(button(app.root, L"APPLY"));
-        click(button(app.root, L"MORE >"));
+        PostMessageW(button(app.root, L"APPLY"), BM_CLICK, 0, 0);
+        eventually([&] {
+            RECT bounds{};
+            GetWindowRect(app.root, &bounds);
+            return bounds.right - bounds.left == 360 && bounds.bottom - bounds.top == 360;
+        }, "minimum window size applies");
+        PostMessageW(button(app.root, L"MORE >"), BM_CLICK, 0, 0);
+        eventually([&] { return buttons(app.root, L"SET TIMER").size() == 1; }, "More Settings opens");
         start_busy_timer(app.root);
-        back(app.root);
-        back(app.root);
+        PostMessageW(button(app.root, L"< BACK"), BM_CLICK, 0, 0);
+        eventually([&] { return IsWindowVisible(edit(app.root, 41)); }, "general Settings returns");
+        PostMessageW(button(app.root, L"< BACK"), BM_CLICK, 0, 0);
+        eventually([&] { return !IsWindowVisible(edit(app.root, 41)); }, "Settings closes");
         send({{"op", "note.add"}, {"title", "Undo sample"}});
         command(app.root, L"/delete-note Undo sample");
-        click(button(app.root, L"DELETE Undo sample"));
-        back(app.root);
+        PostMessageW(button(app.root, L"DELETE Undo sample"), BM_CLICK, 0, 0);
+        eventually([&] { return snapshot().at("trash").size() == 1; }, "Undo sample enters Trash");
+        PostMessageW(button(app.root, L"< BACK"), BM_CLICK, 0, 0);
+        eventually([&] { return IsWindowVisible(edit(app.root, 30)); }, "Notes list returns");
         set_text(edit(app.root, 30), L"/");
         for (int count = 0; count < 4; ++count) message(edit(app.root, 30), WM_KEYDOWN, VK_DOWN);
         const auto content = FindWindowExW(app.root, nullptr, L"Knock.Content.v1", nullptr);
