@@ -71,6 +71,18 @@ HWND edit(HWND root, int id) {
     EnumChildWindows(root, collect, reinterpret_cast<LPARAM>(&query));
     return query.items.empty() ? nullptr : query.items.front();
 }
+RECT control_bounds(HWND control) {
+    RECT bounds{};
+    require(control && IsWindowVisible(control) && GetWindowRect(control, &bounds), "Visible control bounds are unavailable");
+    return bounds;
+}
+void inside_parent(HWND control) {
+    const auto bounds = control_bounds(control);
+    const auto parent = control_bounds(GetParent(control));
+    require(bounds.left >= parent.left && bounds.top >= parent.top && bounds.right <= parent.right &&
+            bounds.bottom <= parent.bottom && bounds.right > bounds.left && bounds.bottom > bounds.top,
+            "Control is clipped at minimum size: " + knock::narrow(caption(control)));
+}
 void click(HWND control) {
     require(IsWindowEnabled(control), "Test action is disabled");
     const auto label = knock::narrow(caption(control));
@@ -530,6 +542,38 @@ int main() {
         }
         screenshot(app.root, L"note-commands-small.bmp");
         passed("slash suggestions fit at minimum size with busy, input and Undo strips present");
+
+        const auto compact_note = send({{"op", "note.add"}, {"title", "Compact layout"}}).at("note");
+        send({{"op", "note.append"}, {"id", compact_note.at("id")}, {"text", "Layout attachment"},
+              {"images", {"reference.png"}}});
+        command(app.root, L"/find-note Compact layout");
+        enter(edit(app.root, 51));
+        eventually([&] { return IsWindowVisible(edit(app.root, 37)); }, "compact conversation opens");
+        entry_menu(app.root, 46, {VK_END, VK_UP, VK_RETURN});
+        eventually([&] { return buttons(app.root, L"SAVE EDIT").size() == 1; }, "image entry edit opens");
+        require(buttons(app.root, L"x").size() == 1, "Attachment is missing from the compact edit draft");
+        ctrl_find(app.root);
+        for (HWND control : buttons(app.root)) if (IsWindowVisible(control)) inside_parent(control);
+        inside_parent(edit(app.root, 37));
+        inside_parent(edit(app.root, 52));
+        require(control_bounds(edit(app.root, 37)).bottom <= control_bounds(button(app.root, L"SAVE EDIT")).top,
+                "Note composer overlaps its actions with Find, attachment, presence, input and quiet strips");
+        screenshot(app.root, L"note-find-attachment-small.bmp");
+        passed("note Find and attachment composer fit at minimum size with presence, input and quiet strips");
+
+        send({{"op", "task.add"}, {"title", "Compact task"}, {"body", "Keep the metadata controls separate."}});
+        click(button(app.root, L"Task List"));
+        eventually([&] { return buttons(app.root, L"Compact task").size() == 1; }, "compact task appears");
+        PostMessageW(button(app.root, L"Compact task"), BM_CLICK, 0, 0);
+        eventually([&] { return IsWindowVisible(edit(app.root, 33)) && IsWindowVisible(edit(app.root, 34)); },
+                   "compact task metadata opens");
+        for (int id : {31, 32, 33, 34}) inside_parent(edit(app.root, id));
+        for (HWND control : buttons(app.root)) if (IsWindowVisible(control)) inside_parent(control);
+        require(control_bounds(edit(app.root, 32)).bottom <= control_bounds(edit(app.root, 33)).top &&
+                control_bounds(edit(app.root, 32)).bottom <= control_bounds(edit(app.root, 34)).top,
+                "Task description overlaps metadata with presence, input and quiet strips");
+        screenshot(app.root, L"task-details-small.bmp");
+        passed("task metadata fits at minimum size with presence, input and quiet strips");
         app.close();
         std::filesystem::remove_all(app.directory);
         std::cout << "All notes UI checks passed. No global input was generated.\n";
