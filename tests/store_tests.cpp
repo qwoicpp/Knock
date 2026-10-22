@@ -879,6 +879,168 @@ void trash_retention_migration_and_rollback() {
     try { rejected.load(); } catch (...) { threw = true; }
     check(threw && read_file(path) == contents, "invalid stored preferences were overwritten");
 }
+
+void message_edits_keep_identity_and_append_retries() {
+    Fixture f;
+    const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Editable notes"}}))["note"];
+    const Json append{{"op", "note.append"}, {"id", note["id"]}, {"text", "Original café"},
+        {"images", {"first.png"}}, {"client_id", std::string(32, 'b')}};
+    const auto original = ok(f.store.handle(append))["message"];
+    auto command = Json{{"op", "note.message.edit"}, {"id", note["id"]}, {"message_id", original["id"]},
+        {"text", "Corrected 日本語"}, {"expected_revision", 0}};
+    auto edited = ok(f.store.handle(command))["message"];
+    check(edited["id"] == original["id"] && edited["created_at"] == original["created_at"] &&
+          edited["images"] == original["images"] && edited["revision"] == 1 && edited.contains("edited_at"),
+          "edit replaced identity, attachment, timestamp, or revision");
+    check(!edited.contains("append_payload"), "private append payload leaked in edit response");
+    check(ok(f.store.handle(append))["message"] == edited, "original append retry was invalidated by editing");
+    auto changed_append = append;
+    changed_append["text"] = edited["text"];
+    fails(f.store.handle(changed_append), "message_client_id_conflict");
+    const auto found = ok(f.store.handle({{"op", "note.message.get"}, {"id", note["id"]}, {"message_id", original["id"]}}));
+    check(found["message"] == edited && found["message_index"] == 0 && found["message_count"] == 1,
+          "message ID lookup returned wrong content or position");
+    check(ok(f.store.handle({{"op", "note.find_message"}, {"id", note["id"]}, {"client_id", std::string(32, 'b')}}))["message"] == edited,
+          "client token lookup returned an unedited or private message");
+    fails(f.store.handle(command), "message_edit_conflict");
+    command["expected_revision"] = 1;
+    check(ok(f.store.handle(command))["message"] == edited, "no-op edit changed revision or edit timestamp");
+    command["text"] = "";
+    command["images"] = {"second.png"};
+    edited = ok(f.store.handle(command))["message"];
+    check(edited["revision"] == 2 && edited["images"] == Json({"second.png"}), "attachment edit failed");
+    check(ok(f.store.handle(append))["message"] == edited, "second edit replaced original append retry payload");
+    f.store.stop();
+    Store restarted(f.directory);
+    restarted.load();
+    check(ok(restarted.handle(append))["message"] == edited, "append retry identity was lost after restart");
+    check(ok(restarted.handle({{"op", "note.get"}, {"id", note["id"]}}))["note"]["messages"][0] == edited,
+          "note history leaked original append contents or changed edited message");
+    ok(restarted.handle({{"op", "note.delete"}, {"id", note["id"]}}));
+    ok(restarted.handle({{"op", "note.restore"}, {"id", note["id"]}}));
+    check(ok(restarted.handle(append))["message"] == edited, "Trash/Restore invalidated append identity");
+}
+
+void message_edit_conflicts_validation_and_rollback() {
+    Fixture f;
+    const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Concurrent edits"}}))["note"];
+    auto original = ok(f.store.handle({{"op", "note.append"}, {"id", note["id"]}, {"text", "Original"}}))["message"];
+    const Json base{{"op", "note.message.edit"}, {"id", note["id"]}, {"message_id", original["id"]},
+        {"text", "New text"}, {"expected_revision", 0}};
+    const std::vector<Json> invalid = {
+        {{"text", " "}}, {{"text", std::string(65537, 'a')}}, {{"text", std::string("\xff", 1)}},
+        {{"expected_revision", -1}}, {{"expected_revision", 0.5}}, {{"images", {"../no.png"}}}
+    };
+    for (const auto& changes : invalid) {
+        auto command = base;
+        command.update(changes);
+        fails(f.store.handle(command));
+    }
+    auto missing = base;
+    missing.erase("expected_revision");
+    fails(f.store.handle(missing), "missing_field");
+    missing = base;
+    missing.erase("text");
+    fails(f.store.handle(missing), "missing_field");
+    const auto state_path = f.directory / "state.json";
+    const auto backup = f.directory / "saved.json";
+    std::filesystem::rename(state_path, backup);
+    std::filesystem::create_directory(state_path);
+    fails(f.store.handle(base));
+    check(ok(f.store.handle({{"op", "note.message.get"}, {"id", note["id"]}, {"message_id", original["id"]}}))["message"] == original,
+          "failed edit changed the in-memory message");
+    std::filesystem::remove(state_path);
+    std::filesystem::rename(backup, state_path);
+    auto alternate = base;
+    alternate["text"] = "Another edit";
+    auto first = std::async(std::launch::async, [&] { return f.store.handle(base); });
+    auto second = std::async(std::launch::async, [&] { return f.store.handle(alternate); });
+    const auto a = first.get(), b = second.get();
+    check(a.value("ok", false) != b.value("ok", false), "concurrent edits both overwrote the same revision");
+    fails(a.value("ok", false) ? b : a, "message_edit_conflict");
+    ok(f.store.handle({{"op", "note.message.remove"}, {"id", note["id"]}, {"message_id", original["id"]}}));
+    fails(f.store.handle(base), "message_not_found");
+    fails(f.store.handle({{"op", "note.message.get"}, {"id", note["id"]}, {"message_id", original["id"]}}), "message_not_found");
+}
+
+void note_search_unicode_paging_and_locations() {
+    Fixture f;
+    const auto first = ok(f.store.handle({{"op", "note.add"}, {"title", "Websites"}}))["note"];
+    const auto second = ok(f.store.handle({{"op", "note.add"}, {"title", "Research"}}))["note"];
+    const auto removed = ok(f.store.handle({{"op", "note.add"}, {"title", "Deleted"}}))["note"];
+    const auto append = [&](const Json& note, const std::string& text) {
+        return ok(f.store.handle({{"op", "note.append"}, {"id", note["id"]}, {"text", text}}))["message"];
+    };
+    const auto early = append(first, "Keep this before the search result.");
+    const auto accented = append(first, "Café — ΩΜΈΓΑ — ЖУРНАЛ — 日本語 🧪");
+    const auto repeated = append(first, "café café CAFÉ");
+    const auto elsewhere = append(second, "Another CAFÉ link");
+    append(removed, "CAFÉ must not appear in active search");
+    ok(f.store.handle({{"op", "note.delete"}, {"id", removed["id"]}}));
+    const auto before = f.store.snapshot();
+    const auto disk_before = read_file(f.directory / "state.json");
+    std::set<std::string> found_ids;
+    std::size_t offset = 0;
+    for (;;) {
+        const auto result = ok(f.store.handle({{"op", "note.search"}, {"query", "CAFÉ"}, {"offset", offset}, {"limit", 1}}));
+        check(result["total"] == 3 && result["items"].size() == 1, "search paging counted repeats or included Trash");
+        const auto& item = result["items"][0];
+        check(!item.contains("messages") && !item.contains("images") && item["excerpt"].is_string(),
+              "search returned an unbounded note instead of an excerpt");
+        check(found_ids.insert(item["message_id"].get<std::string>()).second, "search paging repeated a result");
+        if (result["next_offset"].is_null()) break;
+        offset = result["next_offset"].get<std::size_t>();
+    }
+    check(found_ids == std::set<std::string>{accented["id"], repeated["id"], elsewhere["id"]},
+          "search lost a Unicode message");
+    for (const auto* query : {"café", "ωμέγα", "журнал", "日本語", "🧪"}) {
+        const auto result = ok(f.store.handle({{"op", "note.search"}, {"id", first["id"]}, {"query", query}}));
+        check(!result["items"].empty() && result["items"][0]["message_id"] == accented["id"] &&
+              result["items"][0]["message_index"] == 1, "Unicode search or message location is wrong");
+    }
+    const auto local = ok(f.store.handle({{"op", "note.search"}, {"id", first["id"]}, {"query", "café"}}));
+    check(local["total"] == 2 && local["items"][0]["message_id"] == accented["id"] &&
+          local["items"][1]["message_id"] == repeated["id"], "within-note search changed chronological order");
+    const auto end = ok(f.store.handle({{"op", "note.search"}, {"query", "café"}, {"offset", 999}}));
+    check(end["total"] == 3 && end["items"].empty() && end["next_offset"].is_null(), "past-end search page is wrong");
+    check(f.store.snapshot() == before && read_file(f.directory / "state.json") == disk_before,
+          "search mutated or rewrote persistent data");
+    ok(f.store.handle({{"op", "note.message.remove"}, {"id", first["id"]}, {"message_id", early["id"]}}));
+    const auto relocated = ok(f.store.handle({{"op", "note.message.get"}, {"id", first["id"]}, {"message_id", accented["id"]}}));
+    check(relocated["message_index"] == 0, "ID lookup used a stale search offset after deletion");
+    fails(f.store.handle({{"op", "note.search"}, {"id", removed["id"]}, {"query", "café"}}), "not_found");
+}
+
+void note_search_bounds_and_current_content() {
+    Fixture f;
+    const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Long entries"}}))["note"];
+    std::string prefix;
+    for (int index = 0; index < 1000; ++index) prefix += "日本語🧪";
+    const auto body = prefix + "needle\nCAFÉ\t" + prefix;
+    const auto message = ok(f.store.handle({{"op", "note.append"}, {"id", note["id"]}, {"text", body},
+        {"client_id", std::string(32, 'c')}}))["message"];
+    const auto result = ok(f.store.handle({{"op", "note.search"}, {"query", "NEEDLE"}}));
+    const auto excerpt = result["items"][0]["excerpt"].get<std::string>();
+    check(excerpt.size() <= 774 && excerpt.find("needle") != std::string::npos &&
+          excerpt.starts_with("…") && excerpt.ends_with("…") && excerpt.find('\n') == std::string::npos,
+          "long Unicode excerpt is malformed or does not surround its match");
+    (void)Json(excerpt).dump();
+    const std::vector<Json> invalid = {
+        {{"query", ""}}, {{"query", " \t"}}, {{"query", std::string(513, 'x')}},
+        {{"query", std::string("\xff", 1)}}, {{"query", 42}}, {{"query", "needle"}, {"offset", -1}},
+        {{"query", "needle"}, {"limit", 0}}, {{"query", "needle"}, {"limit", 101}}
+    };
+    for (auto command : invalid) { command["op"] = "note.search"; fails(f.store.handle(command)); }
+    ok(f.store.handle({{"op", "note.message.edit"}, {"id", note["id"]}, {"message_id", message["id"]},
+        {"expected_revision", 0}, {"text", "Replacement"}}));
+    check(ok(f.store.handle({{"op", "note.search"}, {"query", "needle"}}))["total"] == 0,
+          "search exposed private original-append contents after editing");
+    const auto fresh = ok(f.store.handle({{"op", "note.search"}, {"query", "replacement"}}));
+    check(fresh["total"] == 1 && fresh["items"][0]["message_id"] == message["id"], "edit did not update searchable content");
+    ok(f.store.handle({{"op", "note.append"}, {"id", note["id"]}, {"images", {"needle.png"}}}));
+    check(ok(f.store.handle({{"op", "note.search"}, {"query", "needle"}}))["total"] == 0,
+          "text search treated an attachment filename as a message");
+}
 } // namespace
 
 int main() {
@@ -908,7 +1070,11 @@ int main() {
         {"cancellation and archiving", cancellation_and_archiving},
         {"GUI preferences validation and persistence", preferences_are_validated_and_gui_owned},
         {"note trash restore and permanent deletion", note_trash_restore_and_purge},
-        {"trash retention, migration, and save rollback", trash_retention_migration_and_rollback}
+        {"trash retention, migration, and save rollback", trash_retention_migration_and_rollback},
+        {"message edits preserve append identity", message_edits_keep_identity_and_append_retries},
+        {"message edit concurrency, validation, and rollback", message_edit_conflicts_validation_and_rollback},
+        {"note search Unicode, paging, and stable locations", note_search_unicode_paging_and_locations},
+        {"note search bounds and edited content", note_search_bounds_and_current_content}
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

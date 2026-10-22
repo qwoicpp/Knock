@@ -8,6 +8,8 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <locale>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -163,6 +165,13 @@ std::string message_client_id(const Json& object, bool required = false) {
     return value;
 }
 
+Json message_view(const Json& message) {
+    auto view = message;
+    view.erase("append_payload");
+    if (!view.contains("revision")) view["revision"] = 0;
+    return view;
+}
+
 Json note_view(const Json& note, bool preview_body = false) {
     Json view = Json::object();
     for (const auto* field : {"id", "title", "body", "tags", "created_at", "updated_at", "deleted_at"})
@@ -302,16 +311,169 @@ Json read_note(const Json& note, const Json& command) {
     std::size_t encoded_bytes = result.dump().size() + std::to_string(total).size();
     const auto start = static_cast<std::size_t>(offset);
     for (std::size_t index = start; index < total && page.size() < limit; ++index) {
-        const auto message_bytes = messages[index].dump().size() + (page.empty() ? 0 : 1);
+        auto message = message_view(messages[index]);
+        const auto message_bytes = message.dump().size() + (page.empty() ? 0 : 1);
         if (encoded_bytes + message_bytes > max_list_bytes) {
             if (page.empty()) throw std::runtime_error("note_message_exceeds_page_budget");
             break;
         }
         encoded_bytes += message_bytes;
-        page.push_back(messages[index]);
+        page.push_back(std::move(message));
     }
     const auto next = start + page.size();
     if (next < total) result["next_offset"] = next;
+    return result;
+}
+
+struct TextMatch {
+    std::size_t offset;
+    std::size_t length;
+};
+
+// Search uses the same ordinal Windows comparison as the title picker. The
+// portable test build uses the C.UTF-8 wide-character facet without changing
+// the process locale; if unavailable, it preserves non-ASCII characters.
+class NoteMatcher {
+public:
+    explicit NoteMatcher(const std::string& query) {
+#ifdef _WIN32
+        query_ = wide(query);
+#else
+        for (std::size_t offset = 0; offset < query.size();)
+            query_.push_back(fold(decode(query, offset)));
+        prefix_.resize(query_.size());
+        for (std::size_t index = 1, matched = 0; index < query_.size(); ++index) {
+            while (matched && query_[index] != query_[matched]) matched = prefix_[matched - 1];
+            if (query_[index] == query_[matched]) ++matched;
+            prefix_[index] = matched;
+        }
+#endif
+    }
+
+    std::optional<TextMatch> find(const std::string& text) const {
+        if (text.empty()) return std::nullopt;
+#ifdef _WIN32
+        const auto value = wide(text);
+        const auto found = FindStringOrdinal(FIND_FROMSTART, value.data(), static_cast<int>(value.size()),
+            query_.data(), static_cast<int>(query_.size()), TRUE);
+        if (found < 0) return std::nullopt;
+        const auto offset = utf8_length(value.data(), found);
+        const auto length = utf8_length(value.data() + found, static_cast<int>(query_.size()));
+        return TextMatch{offset, length};
+#else
+        // KMP keeps repeated-prefix searches linear even in a large note. Only
+        // the last query-length byte positions are needed to locate an excerpt.
+        std::vector<std::size_t> starts(query_.size());
+        std::size_t matched = 0, characters = 0;
+        for (std::size_t offset = 0; offset < text.size(); ++characters) {
+            starts[characters % starts.size()] = offset;
+            const auto character = fold(decode(text, offset));
+            while (matched && character != query_[matched]) matched = prefix_[matched - 1];
+            if (character == query_[matched]) ++matched;
+            if (matched == query_.size()) {
+                const auto first = starts[(characters + 1 - matched) % starts.size()];
+                return TextMatch{first, offset - first};
+            }
+        }
+        return std::nullopt;
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    std::wstring query_;
+
+    static std::wstring wide(const std::string& text) {
+        if (text.empty()) return {};
+        const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+            static_cast<int>(text.size()), nullptr, 0);
+        if (!count) throw std::runtime_error("invalid_search_text");
+        std::wstring result(static_cast<std::size_t>(count), L'\0');
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                                result.data(), count)) throw std::runtime_error("invalid_search_text");
+        return result;
+    }
+
+    static std::size_t utf8_length(const wchar_t* text, int count) {
+        if (!count) return 0;
+        const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, count, nullptr, 0, nullptr, nullptr);
+        if (!length) throw std::runtime_error("invalid_search_match");
+        return static_cast<std::size_t>(length);
+    }
+#else
+    std::vector<wchar_t> query_;
+    std::vector<std::size_t> prefix_;
+
+    static wchar_t decode(const std::string& text, std::size_t& offset) {
+        const auto lead = static_cast<unsigned char>(text[offset++]);
+        const unsigned int trailing = lead < 0x80 ? 0 : (lead < 0xE0 ? 1 : (lead < 0xF0 ? 2 : 3));
+        std::uint32_t value = trailing ? lead & (0x3Fu >> trailing) : lead;
+        for (unsigned int index = 0; index < trailing; ++index)
+            value = (value << 6) | (static_cast<unsigned char>(text[offset++]) & 0x3Fu);
+        return static_cast<wchar_t>(value);
+    }
+
+    static wchar_t fold(wchar_t character) {
+        static const std::locale locale = [] {
+            try { return std::locale("C.UTF-8"); }
+            catch (const std::runtime_error&) { return std::locale::classic(); }
+        }();
+        return std::use_facet<std::ctype<wchar_t>>(locale).tolower(character);
+    }
+#endif
+};
+
+std::string search_excerpt(const std::string& text, TextMatch match) {
+    auto first = match.offset > 64 ? match.offset - 64 : 0;
+    while (first && (static_cast<unsigned char>(text[first]) & 0xC0) == 0x80) --first;
+    auto last = std::min(text.size(), std::min(first + 768,
+        std::max(first + 256, match.offset + match.length + 64)));
+    while (last < text.size() && last && (static_cast<unsigned char>(text[last]) & 0xC0) == 0x80) --last;
+    auto excerpt = text.substr(first, last - first);
+    for (auto& character : excerpt)
+        if (character == '\r' || character == '\n' || character == '\t') character = ' ';
+    return (first ? "…" : "") + excerpt + (last < text.size() ? "…" : "");
+}
+
+Json search_notes(const Json& state, const Json& command) {
+    const NoteMatcher matcher(text_field(command, "query", 512, true));
+    const auto offset = static_cast<std::uint64_t>(integer_field(command, "offset", 0, INT64_MAX, 0));
+    const auto limit = static_cast<std::size_t>(integer_field(command, "limit", 1, 100, 50));
+    std::vector<const Json*> notes;
+    if (command.contains("id")) {
+        const auto id = id_field(command);
+        for (const auto& note : state["notes"])
+            if (note["id"] == id) notes.push_back(&note);
+        if (notes.empty()) throw std::runtime_error("not_found: " + id);
+    } else {
+        for (auto note = state["notes"].rbegin(); note != state["notes"].rend(); ++note) notes.push_back(&*note);
+        std::stable_sort(notes.begin(), notes.end(), [](const Json* left, const Json* right) {
+            return (*left)["updated_at"].get<std::int64_t>() > (*right)["updated_at"].get<std::int64_t>();
+        });
+    }
+    Json result{{"ok", true}, {"items", Json::array()}, {"total", 0}, {"next_offset", nullptr}};
+    auto& items = result["items"];
+    std::size_t total = 0, bytes = result.dump().size() + 40;
+    bool page_full = false;
+    for (const auto* note : notes) {
+        const auto& messages = (*note)["messages"];
+        for (std::size_t index = 0; index < messages.size(); ++index) {
+            const auto& message = messages[index];
+            const auto& text = message["text"].get_ref<const std::string&>();
+            const auto match = matcher.find(text);
+            if (!match) continue;
+            if (total++ < offset || items.size() >= limit || page_full) continue;
+            Json item{{"note_id", (*note)["id"]}, {"title", (*note)["title"]},
+                {"message_id", message["id"]}, {"message_index", index},
+                {"excerpt", search_excerpt(text, *match)}, {"created_at", message["created_at"]}};
+            const auto length = item.dump().size() + (items.empty() ? 0 : 1);
+            if (bytes + length > max_list_bytes) { page_full = true; continue; }
+            bytes += length;
+            items.push_back(std::move(item));
+        }
+    }
+    result["total"] = total;
+    if (offset < total && items.size() < total - offset) result["next_offset"] = offset + items.size();
     return result;
 }
 
@@ -460,11 +622,23 @@ void validate_state(const Json& state) {
                             if (!message_ids.insert(id_field(message)).second)
                                 throw std::runtime_error("duplicate_message_id");
                             integer_field(message, "created_at", 0, INT64_MAX, 0, true);
+                            const auto revision = integer_field(message, "revision", 0, INT64_MAX, 0);
+                            if (message.contains("edited_at")) {
+                                integer_field(message, "edited_at", 0, INT64_MAX, 0, true);
+                                if (!revision) throw std::runtime_error("invalid_message_revision");
+                            } else if (revision) throw std::runtime_error("missing_message_edit_time");
                             const auto text = text_field(message, "text", max_message_bytes);
                             require_message_content(text, note_images(message));
                             const auto client_id = message_client_id(message);
                             if (!client_id.empty() && !client_ids.insert(client_id).second)
                                 throw std::runtime_error("duplicate_message_client_id");
+                            if (message.contains("append_payload")) {
+                                const auto& payload = message["append_payload"];
+                                if (client_id.empty() || !revision || !payload.is_object())
+                                    throw std::runtime_error("invalid_append_payload");
+                                require_fields(payload, {"text", "images"});
+                                require_message_content(text_field(payload, "text", max_message_bytes), note_images(payload));
+                            }
                         }
                     }
                 }
@@ -615,6 +789,9 @@ void Store::load() {
             }
             dirty = true;
         }
+        for (auto& message : note["messages"]) {
+            if (!message.contains("revision")) { message["revision"] = 0; dirty = true; }
+        }
     }
     const auto now = now_ms();
     // An old Yes must not regain control after the tray process has restarted.
@@ -740,7 +917,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
             }
         } else {
             if (expire_locked()) events.push_back(event("updated"));
-            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.trash.list"});
+            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.message.get", "note.trash.list", "note.search"});
             Json previous = may_mutate ? state_ : Json();
             bool dirty = false;
             Json notification;
@@ -815,6 +992,20 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     result = {{"ok", true}, {"job", find_record(state_["jobs"], id_field(command))}};
                 } else if (op == "note.get") {
                     result = read_note(find_record(state_["notes"], id_field(command)), command);
+                } else if (op == "note.search") {
+                    result = search_notes(state_, command);
+                } else if (op == "note.message.get") {
+                    const auto note_id = id_field(command);
+                    const auto& note = find_record(state_["notes"], note_id);
+                    const auto message_id = text_field(command, "message_id", 128, true);
+                    const auto& messages = note["messages"];
+                    const auto found = std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
+                        return message["id"] == message_id;
+                    });
+                    if (found == messages.end()) throw std::runtime_error("message_not_found");
+                    result = {{"ok", true}, {"note_id", note["id"]}, {"message", message_view(*found)},
+                              {"message_index", static_cast<std::size_t>(found - messages.begin())},
+                              {"message_count", messages.size()}};
                 } else if (op == "note.find_message") {
                     const auto client_id = message_client_id(command, true);
                     const auto note_id = id_field(command);
@@ -823,7 +1014,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     const auto found = std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
                         return message.value("client_id", "") == client_id;
                     });
-                    result = {{"ok", true}, {"message", found == messages.end() ? Json() : *found}};
+                    result = {{"ok", true}, {"message", found == messages.end() ? Json() : message_view(*found)}};
                 } else if (op == "note.append") {
                     auto& note = find_record(state_["notes"], id_field(command));
                     auto& messages = note["messages"];
@@ -836,14 +1027,16 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                             return message.value("client_id", "") == client_id;
                         });
                     if (found != messages.end()) {
-                        if ((*found)["text"] != text || (*found)["images"] != images)
+                        const auto& original = found->contains("append_payload") ? (*found)["append_payload"] : *found;
+                        if (original["text"] != text || original["images"] != images)
                             throw std::runtime_error("message_client_id_conflict");
-                        result = {{"ok", true}, {"note_id", note["id"]}, {"message", *found},
+                        result = {{"ok", true}, {"note_id", note["id"]}, {"message", message_view(*found)},
                                   {"message_count", messages.size()}};
                     } else {
                         if (messages.size() >= max_note_messages)
                             throw std::runtime_error("note_message_limit_reached");
-                        Json message{{"id", make_id()}, {"text", text}, {"images", std::move(images)}, {"created_at", now}};
+                        Json message{{"id", make_id()}, {"text", text}, {"images", std::move(images)},
+                                     {"created_at", now}, {"revision", 0}};
                         if (!client_id.empty()) message["client_id"] = client_id;
                         messages.push_back(message);
                         note["updated_at"] = now;
@@ -853,6 +1046,38 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                         notification["operation"] = op;
                         dirty = true;
                     }
+                } else if (op == "note.message.edit") {
+                    auto& note = find_record(state_["notes"], id_field(command));
+                    const auto message_id = text_field(command, "message_id", 128, true);
+                    auto& messages = note["messages"];
+                    auto found = std::find_if(messages.begin(), messages.end(), [&](const Json& message) {
+                        return message["id"] == message_id;
+                    });
+                    if (found == messages.end()) throw std::runtime_error("message_not_found");
+                    const auto revision = found->value("revision", std::int64_t{0});
+                    const auto expected = integer_field(command, "expected_revision", 0, INT64_MAX, 0, true);
+                    if (expected != revision) throw std::runtime_error("message_edit_conflict");
+                    if (!command.contains("text")) throw std::runtime_error("missing_field: text");
+                    const auto text = text_field(command, "text", max_message_bytes);
+                    const auto images = command.contains("images") ? note_images(command) : (*found)["images"];
+                    require_message_content(text, images);
+                    if ((*found)["text"] != text || (*found)["images"] != images) {
+                        if (revision == INT64_MAX) throw std::runtime_error("message_revision_limit_reached");
+                        // Client IDs identify the original append, even after a
+                        // later edit. Keep that payload private for exact retries.
+                        if (found->contains("client_id") && !found->contains("append_payload"))
+                            (*found)["append_payload"] = {{"text", (*found)["text"]}, {"images", (*found)["images"]}};
+                        (*found)["text"] = text;
+                        (*found)["images"] = images;
+                        (*found)["revision"] = revision + 1;
+                        (*found)["edited_at"] = now;
+                        note["updated_at"] = now;
+                        notification = event("updated", &note);
+                        notification["operation"] = op;
+                        dirty = true;
+                    }
+                    result = {{"ok", true}, {"note_id", note["id"]}, {"message", message_view(*found)},
+                              {"message_count", messages.size()}};
                 } else if (op == "note.message.remove") {
                     auto& note = find_record(state_["notes"], id_field(command));
                     const auto message_id = text_field(command, "message_id", 128, true);
