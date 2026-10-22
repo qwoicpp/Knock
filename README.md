@@ -47,6 +47,16 @@ Right-click anywhere in the popup and choose **Settings** to make it yours:
 
 You can also open Settings or quit Knock from the tray menu.
 
+**Settings → More** has saved replies, a busy timer, and how long deleted notes
+stay in Trash. Right-click anywhere and choose **Busy for...** to quiet banners
+for 15 minutes, 30 minutes, or an hour. Requests still wait in the inbox and keep
+their normal expiry. When the timer ends, Knock sends one inbox summary.
+
+In Notifications, click **CHATS** or a chat label to filter the inbox. **ALL
+CHATS** clears it. Pending requests stay above answered requests and build
+results. **CUSTOM → SAVED REPLIES** puts a preset into the reply box; edit it if
+needed, then press **SEND**. Manage your own presets in Settings → More.
+
 To update, quit the running copy and replace its application files. Saved data
 lives separately, so your notes and tasks stay put.
 
@@ -59,6 +69,11 @@ conversation for that note. A name like “Websites” or “Project ideas” is
 - **Ctrl + V** pastes text or an image into the composer. Images appear as
   attachments before you send them.
 - Scroll back through the conversation whenever you need it.
+- Right-click an entry to **Edit entry**. **Up Arrow** in an empty composer
+  edits your latest entry. Save or cancel the edit; your unfinished new message
+  is kept separately, including its pasted images.
+- **Ctrl+F** searches the conversation. Previous/next finds matching entries,
+  including older messages that were not loaded when you opened the note.
 - **TAGS** organizes the note, and **EDIT** changes its title and description.
   **FILTER** on the notes list narrows it to a tag or untagged notes.
 
@@ -75,6 +90,16 @@ takes a couple of commands:
 - **`/delete-note`** opens a separate list for deleting notes. You can add a
   search after this command too. Clicking a **DELETE** row deletes that note;
   **Back** takes you out of the list.
+- **`/search-notes words`** searches the text inside your conversations. Results
+  show a matching excerpt; opening one takes you straight to that entry.
+- **`/trash`** lets you restore deleted notes or delete them permanently.
+  A quick **UNDO** also appears just after deleting a note. Trash keeps notes
+  for 30 days by default; Settings → More lets you choose 1–365 days.
+
+Deleted notes keep their messages, tags, and attachment references in Trash.
+Reducing the retention period removes entries older than the new limit when
+you apply it. Imported image files are retained on disk; attachment cleanup
+isn't implemented yet.
 
 Type **`/`** to see the available commands as you type. Use the arrow keys and
 **Enter**, or click a suggestion. An unknown slash command won't create a note.
@@ -82,9 +107,17 @@ These commands belong to the Notes list; text inside a note stays your text.
 
 ### Agents
 
-Give your agents the path to `knock.exe` and the instructions in
-[AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md). In the portable package,
-that file is beside the executables.
+Give your agents the path to `knock.exe` and tell them to run:
+
+```powershell
+.\knock.exe info
+```
+
+That returns the usage guide, including how to wait without repeated model
+polling, reuse IDs, and keep tool output small. It works without opening the
+tray or reading your saved data. `get-info` is an alias. The same guide is in
+[AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md), beside the executables in
+the portable package.
 
 A request looks like this, from PowerShell in the Knock folder:
 

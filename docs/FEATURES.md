@@ -1,8 +1,11 @@
-# Feature tracker — version 0.4.0
+# Feature tracker — version 0.5.0
 
 - [x] Windows tray lifecycle and popup with no taskbar icon flags
 - [x] Reference-matching Notifications, Task List, Notes
 - [x] Permission request Yes / No / Custom
+- [x] Saved custom-reply presets with add/edit/delete in Settings; selection never sends or approves
+- [x] Busy timer for 15/30/60 minutes, persisted across restarts, with one inbox summary when it ends
+- [x] Chat-label and selector inbox filtering, with pending requests first
 - [x] Blocking CLI results, timeouts, cancellation, exclusive input lease
 - [x] Background command runner, captured output, completion notice and Copy
 - [x] Persistent tasks and personal conversation notes
@@ -17,6 +20,12 @@
 - [x] Notes-list slash-command suggestions with arrow-key and Enter selection
 - [x] `/find-note [query]` with live results ranked by note title
 - [x] `/delete-note [query]` with a separate click-to-delete list and Back
+- [x] `/search-notes [query]` with bounded excerpts, paging and exact-entry jumps
+- [x] Ctrl+F within a conversation, previous/next matching entries and temporary highlighting
+- [x] Edit individual messages, with revision conflicts and separate recoverable edit/composer drafts
+- [x] Up Arrow in an empty composer edits the latest entry; edited entries retain their position
+- [x] Note deletion moves to Trash; quick Undo, /trash Restore and explicit Delete forever
+- [x] Configurable 1–365 day Trash retention, default 30 days; transactional cleanup
 - [x] Unknown slash commands report an error instead of creating notes
 - [x] Text composer: Enter sends, Shift+Enter inserts a newline
 - [x] Clipboard image paste, bounded PNG storage, and inline thumbnails
@@ -29,11 +38,13 @@
 - [x] Settings page with shortcut capture/disable and Start with Windows
 - [x] Configurable popup size: 360–800 × 360–1000 logical pixels; reset to 420 × 510
 - [x] Atomic window-size settings preserve shortcut and unrelated preferences
+- [x] Settings → More for saved replies, busy timers and Trash retention
 - [x] Hotkey opens a persistent topmost popup; ordinary tray opening hides on click-away
 - [x] Dark control initialization and layout repaint fix for tab-switch flash
 - [x] Bottom command-labelled buttons removed; Enter creates tasks and notes
 - [x] Build, automated correctness checks, UI inspection, documented limitations
 - [x] Portable release and complete source package
+- [x] Standalone `knock info` / `get-info` guide for CLI agents, including token-efficient workflows
 
 ## Desktop acceptance still required
 
@@ -48,4 +59,5 @@ desktop. Wine results are documented separately in
 VALIDATION.md.
 
 Imported image files are retained when an attachment, message, or note is
-removed. Automatic cleanup of unreferenced image files is not implemented.
+removed, including after Trash expiry or permanent note deletion. Automatic
+cleanup of unreferenced image files is not implemented.

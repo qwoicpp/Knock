@@ -6,7 +6,7 @@ Knock is a compact Windows tray app with a terminal-style interface. Native Win3
 
 ## Implementation
 
-Version 0.4.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
+Version 0.5.0 is a portable Windows x64 application. Keep `KnockTray.exe`,
 `knock.exe`, and the `assets` directory together. There is no web runtime,
 server account, or network listener.
 
@@ -20,6 +20,15 @@ server account, or network listener.
   Escape backs out of the current view before hiding the popup.
 - Requests require a chat label. Yes, No, and custom replies are persisted.
   Only trusted UI calls may resolve requests. A custom reply never grants input.
+- Custom replies have up to 12 saved presets, managed in Settings → More.
+  Choosing a preset only fills the editor; SEND submits the reply.
+- A persisted busy deadline suppresses banners for 15/30/60 minutes without
+  resolving requests or extending expiry. The app clears the deadline and sends
+  one inbox summary when the timer ends. Right-click or the tray menu controls
+  the timer; its status is shown above the popup content and in the tray tooltip.
+- The inbox filters by exact chat label from a card or CHATS selector. Pending
+  requests sort first. Notification clicks clear the filter before opening the
+  relevant request/result.
 - Input approvals are exclusive, time-limited cooperative leases. Release,
   timeout, and restart revoke permission. Blocking CLI waits use a condition
   variable, so the model does not need to poll.
@@ -36,6 +45,20 @@ server account, or network listener.
   opens a dedicated click-to-delete page with Back. Slash-prefix suggestions
   and results support arrow keys and Enter; unknown commands never create a
   note. Commands are not interpreted inside note conversations.
+- `/search-notes [query]` searches message text with Unicode case-insensitive
+  comparison on Windows, bounded excerpts and result pages. Opening a result
+  resolves its message ID again before scrolling and highlighting it. Ctrl+F
+  searches the current conversation, including its older history.
+- Entry editing uses a required expected revision, preserving message ID,
+  creation time and position. Stale edits fail without overwriting current text.
+  The original append payload remains private to storage so a retry of the
+  original client_id stays idempotent after editing. A separate edit draft
+  preserves the normal composer draft and attachments through hide/restart.
+- Note deletion moves the complete record into Trash. Undo lasts 10 seconds;
+  `/trash` restores records or offers an explicit permanent-delete action.
+  Retention defaults to 30 days and is configurable from 1 to 365 in Settings →
+  More. Expiry and preference changes are transactional; request approval rules
+  are unaffected. Imported images are retained even after purging a note.
 - Clearing a title leaves the editor blank through background saves and
   incoming updates. Explicit save/navigation requires a nonblank title and
   keeps focus on the draft when validation fails. Hiding preserves the current
@@ -55,6 +78,14 @@ server account, or network listener.
   unrelated preferences; registration conflicts and failed writes preserve the
   previous working shortcut and size. Invalid settings report an error instead
   of silently replacing the file. The tray menu also opens Settings.
+- Inbox/Trash preferences live with transactional state; hotkey/window settings
+  remain in settings.json. Only trusted UI calls can change inbox preferences or
+  permanently purge Trash. Settings → More contains the additional preferences.
+- `knock info` and `knock get-info` print the agent guide without opening the
+  tray or reading saved data. CMake embeds docs/AGENT_INSTRUCTIONS.md as the one
+  source for the CLI text. `help` and `info` produce plain text; other commands
+  keep their JSON contract. The guide explains single waits, detached jobs,
+  retaining IDs and bounded output; it makes no automatic CLI-resume claim.
 - Terminal-style tabs have icons, separate tab surfaces,
   and an active tab connected to the content. Scroll thumbs are one logical
   pixel wide, with wider invisible drag targets.
