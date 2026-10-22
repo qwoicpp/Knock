@@ -358,7 +358,8 @@ private:
     int inbox_bar_y_ = 0;
     int busy_bar_y_ = 0;
     bool busy_was_active_ = false;
-    std::int64_t busy_completed_deadline_ = 0;
+    bool busy_summary_pending_ = false;
+    ULONGLONG busy_retry_after_ = 0;
     int scroll_[3]{};
     int content_height_ = 0;
     int viewport_height_ = 0;
@@ -471,28 +472,32 @@ private:
     }
     void update_busy_mode() {
         const bool active = busy();
-        if (active && !busy_was_active_) quiet_banners();
-        if (!active && busy_was_active_) {
-            busy_was_active_ = false;
-            const auto deadline = busy_deadline();
-            if (deadline && busy_completed_deadline_ != deadline) {
-                busy_completed_deadline_ = deadline;
-                // Persist completion so a later restart does not announce it again.
-                save_preferences({{"busy_until", 0}});
-            }
-            busy_summary();
-        }
+        if (active) {
+            if (!busy_was_active_) quiet_banners();
+            busy_summary_pending_ = false;
+            busy_retry_after_ = 0;
+        } else if (busy_was_active_) busy_summary_pending_ = true;
         if (active != busy_was_active_) {
             busy_was_active_ = active;
             layout();
         }
-        if (!active && busy_bar_y_) layout();
+        if (busy_summary_pending_ && GetTickCount64() >= busy_retry_after_) {
+            // A failed state write or snapshot must be retried, without
+            // repeatedly announcing the same completion during this session.
+            busy_retry_after_ = GetTickCount64() + 5000;
+            try {
+                if (!busy_deadline() || save_preferences({{"busy_until", 0}})) {
+                    busy_summary();
+                    busy_summary_pending_ = false;
+                }
+            } catch (const std::exception& error) { feedback(widen(error.what())); }
+        }
         update_tray();
     }
     void set_busy_minutes(int minutes) {
         const bool previous = busy_was_active_;
         if (!save_preferences({{"busy_until", minutes ? now_ms() + std::int64_t(minutes) * 60000 : 0}})) return;
-        busy_completed_deadline_ = 0;
+        busy_retry_after_ = 0;
         busy_was_active_ = previous;
         update_busy_mode();
         layout();
