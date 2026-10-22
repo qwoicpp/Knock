@@ -210,6 +210,7 @@ public:
 private:
     enum class Tab { notifications, tasks, notes };
     enum class Detail { none, task, note };
+    enum class SaveIntent { explicit_action, background };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
         HWND handle = nullptr;
@@ -483,7 +484,7 @@ private:
         }
     }
     void hide() {
-        if (!save_detail()) return;
+        if (!save_detail(SaveIntent::background)) return;
         if (reply_edit_) drafts_[reply_id_] = narrow(edit_text(reply_edit_));
         ShowWindow(window_, SW_HIDE);
         keep_open_ = false;
@@ -616,11 +617,19 @@ private:
         layout();
         SetFocus(body_edit_);
     }
-    bool save_detail() {
+    bool save_detail(SaveIntent intent = SaveIntent::explicit_action) {
         if (detail_ == Detail::note && !save_note_draft()) return false;
         if (detail_ == Detail::none || !detail_dirty_) return true;
         auto title = trim(narrow(edit_text(title_edit_)));
-        if (title.empty()) title = detail_original_title_;
+        if (title.empty()) {
+            KillTimer(window_, 3);
+            // A title can be temporarily empty while it is being replaced.
+            // Keep the edits dirty so an incoming update cannot restore it.
+            if (intent == SaveIntent::background) return true;
+            feedback(L"Add a title before saving.");
+            SetFocus(title_edit_);
+            return false;
+        }
         Json command{{"op", detail_ == Detail::note ? "note.update" : "task.update"},
             {"id", detail_id_}, {"title", title}, {"body", narrow(edit_text(body_edit_))}};
         if (detail_ == Detail::task) {
@@ -2033,7 +2042,7 @@ private:
                 redraw = complete_sprite_.advance() || redraw;
                 redraw = note_sprite_.advance() || redraw;
                 if (redraw) InvalidateRect(content_, nullptr, FALSE);
-            } else if (wparam == 3) { KillTimer(window_, 3); save_detail(); }
+            } else if (wparam == 3) { KillTimer(window_, 3); save_detail(SaveIntent::background); }
             else if (wparam == 4) { KillTimer(window_, 4); save_note_draft(); }
             return 0;
         case WM_CLOSE: hide(); return 0;

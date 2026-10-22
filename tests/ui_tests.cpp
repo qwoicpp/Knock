@@ -522,6 +522,52 @@ int main() {
         click(button(app.root, L"EDIT"));
         passed("external tags, metadata, tabs, and hide preserve the unsent draft and existing message IDs");
 
+        click(button(app.root, L"EDIT"));
+        eventually([&] { return edit(app.root, 31) && edit(app.root, 32); }, "metadata for cleared-title regression");
+        const auto empty_title_edit = edit(app.root, 31);
+        const auto pending_body_edit = edit(app.root, 32);
+        const std::wstring pending_description = description + L"\r\nKeep this while I replace the title.";
+        set_text(empty_title_edit, L"A title I changed my mind about");
+        set_text(empty_title_edit, L"");
+        set_text(pending_body_edit, pending_description);
+        // Let the real 600 ms autosave run before an unrelated note update.
+        std::this_thread::sleep_for(850ms);
+        app.cli({L"notes", L"update", knock::widen(working_id), L"--tag", L"Pending title"});
+        std::this_thread::sleep_for(100ms);
+        message(app.root, WM_NULL);
+        require(edit(app.root, 31) == empty_title_edit && window_text(empty_title_edit).empty() &&
+                edit(app.root, 32) == pending_body_edit && window_text(pending_body_edit) == pending_description,
+                "Autosave or an incoming update restored the cleared title or replaced pending metadata");
+        require(saved_note(working_id)["title"] == "Working note" &&
+                saved_note(working_id)["body"] == knock::narrow(description),
+                "Background save committed incomplete metadata with an empty title");
+        message(app.root, WM_CLOSE);
+        eventually([&] { return !IsWindowVisible(app.root); }, "hide with an incomplete note title");
+        message(app.root, WM_APP + 20);
+        eventually([&] { return IsWindowVisible(app.root); }, "reopen with an incomplete note title");
+        require(edit(app.root, 31) == empty_title_edit && window_text(empty_title_edit).empty() &&
+                edit(app.root, 32) == pending_body_edit && window_text(pending_body_edit) == pending_description,
+                "Hide/reopen discarded or repopulated incomplete note metadata");
+        click(button(app.root, L"SAVE"));
+        require(edit(app.root, 31) == empty_title_edit && IsWindowVisible(empty_title_edit) &&
+                window_text(empty_title_edit).empty() && focus_of(app.root) == empty_title_edit,
+                "Explicit Save silently accepted or restored an empty title");
+        click(note_tab);
+        require(edit(app.root, 31) == empty_title_edit && window_text(empty_title_edit).empty() &&
+                window_text(pending_body_edit) == pending_description,
+                "Navigation discarded unfinished metadata after validation failed");
+        set_text(empty_title_edit, L"Working note renamed");
+        click(button(app.root, L"SAVE"));
+        eventually([&] { return !edit(app.root, 31) && IsWindowVisible(edit(app.root, 37)); },
+                   "save the replacement title and return to the conversation");
+        const auto renamed_note = saved_note(working_id);
+        require(renamed_note["title"] == "Working note renamed" &&
+                renamed_note["body"] == knock::narrow(pending_description) &&
+                renamed_note["tags"] == Json::array({"Pending title"}) &&
+                renamed_note["messages"] == working_messages && window_text(edit(app.root, 37)) == external_draft,
+                "Saving a replacement title lost metadata, tags, messages, or the unsent conversation draft");
+        passed("cleared title stays empty through autosave, updates, hide, and validation until replaced");
+
         const std::wstring deleted_draft = L"Keep this fresh draft even if an agent removes its note";
         set_text(edit(app.root, 37), deleted_draft);
         app.cli({L"notes", L"remove", knock::widen(working_id)});
