@@ -39,10 +39,20 @@ constexpr std::size_t max_tag_codepoints = 32;
 constexpr std::size_t max_note_messages = 2000;
 constexpr std::size_t max_message_bytes = 64 * 1024;
 constexpr std::size_t max_message_images = 8;
+constexpr std::int64_t day_ms = 24 * 60 * 60 * 1000;
+
+Json default_preferences() {
+    return {{"saved_replies", Json::array({
+                "I'm using the computer. Continue with headless tests.",
+                "Finish everything else first, then ask again.",
+                "Explain what you need to test before using the mouse."})},
+            {"busy_until", 0}, {"trash_retention_days", 30}};
+}
 
 Json empty_state() {
     return {{"schema", 1}, {"requests", Json::array()}, {"jobs", Json::array()},
-            {"tasks", Json::array()}, {"notes", Json::array()}, {"lease", nullptr}};
+            {"tasks", Json::array()}, {"notes", Json::array()}, {"trash", Json::array()},
+            {"preferences", default_preferences()}, {"lease", nullptr}};
 }
 
 bool has_text(const std::string& value) {
@@ -155,7 +165,7 @@ std::string message_client_id(const Json& object, bool required = false) {
 
 Json note_view(const Json& note, bool preview_body = false) {
     Json view = Json::object();
-    for (const auto* field : {"id", "title", "body", "tags", "created_at", "updated_at"})
+    for (const auto* field : {"id", "title", "body", "tags", "created_at", "updated_at", "deleted_at"})
         if (note.contains(field)) view[field] = note[field];
     view["message_count"] = note.contains("messages") ? note["messages"].size() : 0;
     if (preview_body) {
@@ -198,6 +208,19 @@ std::string id_field(const Json& object) {
     return id;
 }
 
+void validate_preferences(const Json& preferences) {
+    if (!preferences.is_object()) throw std::runtime_error("invalid_preferences");
+    integer_field(preferences, "busy_until", 0, INT64_MAX, 0);
+    integer_field(preferences, "trash_retention_days", 1, 365, 30);
+    if (preferences.contains("saved_replies")) {
+        const auto& replies = preferences["saved_replies"];
+        if (!replies.is_array()) throw std::runtime_error("invalid_array: saved_replies");
+        if (replies.size() > 12) throw std::runtime_error("too_many_saved_replies: maximum 12");
+        for (const auto& reply : replies)
+            text_field(Json{{"reply", reply}}, "reply", 2000, true);
+    }
+}
+
 bool is_one_of(const std::string& value, std::initializer_list<const char*> options) {
     return std::any_of(options.begin(), options.end(), [&](const char* option) {
         return value == option;
@@ -222,7 +245,7 @@ Json record_summary(const Json& record) {
     for (const auto* field : {"id", "chat", "title", "kind", "status", "operator", "project", "tags",
                              "created_at", "updated_at", "finished_at", "resolved_at", "expires_at",
                              "lease_seconds", "lease_until", "released_at", "release_reason",
-                             "exit_code", "worker_pid", "archived"}) {
+                             "exit_code", "worker_pid", "archived", "deleted_at"}) {
         if (record.contains(field)) result[field] = record[field];
     }
     if (record.contains("messages")) result["message_count"] = record["messages"].size();
@@ -231,7 +254,7 @@ Json record_summary(const Json& record) {
 
 Json list_records(const Json& state, const Json& command) {
     const auto collection = text_field(command, "collection", 16, true);
-    if (!is_one_of(collection, {"requests", "jobs", "tasks", "notes"}))
+    if (!is_one_of(collection, {"requests", "jobs", "tasks", "notes", "trash"}))
         throw std::runtime_error("invalid_collection");
     const auto offset = static_cast<std::uint64_t>(integer_field(command, "offset", 0, INT64_MAX, 0));
     const auto limit = static_cast<std::size_t>(integer_field(command, "limit", 1, 100, 50));
@@ -251,7 +274,7 @@ Json list_records(const Json& state, const Json& command) {
     for (std::size_t index = start; index < total && items.size() < limit; ++index) {
         const auto& record = records[total - 1 - index];
         Json item = summaries ? record_summary(record) :
-            (collection == "notes" ? note_view(record) : record);
+            (collection == "notes" || collection == "trash" ? note_view(record) : record);
         const auto item_bytes = item.dump().size() + (items.empty() ? 0 : 1);
         if (encoded_bytes + item_bytes > max_list_bytes) {
             if (items.empty()) throw std::runtime_error("list_item_exceeds_page_budget: use summaries=true");
@@ -335,6 +358,15 @@ bool expire_records(Json& state, std::int64_t now) {
         state["lease"] = nullptr;
         changed = true;
     }
+    if (state.contains("trash")) {
+        const auto cutoff = now - state["preferences"]["trash_retention_days"].get<std::int64_t>() * day_ms;
+        auto& trash = state["trash"];
+        const auto count = trash.size();
+        trash.erase(std::remove_if(trash.begin(), trash.end(), [&](const Json& note) {
+            return note["deleted_at"].get<std::int64_t>() <= cutoff;
+        }), trash.end());
+        changed = changed || trash.size() != count;
+    }
     return changed;
 }
 
@@ -342,8 +374,10 @@ void validate_state(const Json& state) {
     if (!state.is_object() || integer_field(state, "schema", 1, 1, 0, true) != 1)
         throw std::runtime_error("unsupported_state_schema");
     if (!state.contains("lease")) throw std::runtime_error("missing_lease");
+    if (state.contains("preferences")) validate_preferences(state["preferences"]);
     std::set<std::string> ids;
-    for (const auto* collection : {"requests", "jobs", "tasks", "notes"}) {
+    for (const auto* collection : {"requests", "jobs", "tasks", "notes", "trash"}) {
+        if (std::string_view(collection) == "trash" && !state.contains("trash")) continue;
         if (!state.contains(collection) || !state[collection].is_array() ||
             state[collection].size() > max_records)
             throw std::runtime_error(std::string("invalid_collection: ") + collection);
@@ -411,6 +445,8 @@ void validate_state(const Json& state) {
                     if (!is_one_of(text_field(record, "status", 16, true), {"todo", "in_progress", "done"}))
                         throw std::runtime_error("invalid_task_status");
                 } else {
+                    if (category == "trash") integer_field(record, "deleted_at", 0, INT64_MAX, 0, true);
+                    else if (record.contains("deleted_at")) throw std::runtime_error("active_note_has_deleted_at");
                     (void)note_tags(record);
                     if (record.contains("messages")) {
                         const auto& messages = record["messages"];
@@ -435,6 +471,8 @@ void validate_state(const Json& state) {
             }
         }
     }
+    if (state["notes"].size() + (state.contains("trash") ? state["trash"].size() : 0) > max_records)
+        throw std::runtime_error("invalid_note_count");
     if (!state["lease"].is_null()) {
         const auto& lease = state["lease"];
         if (!lease.is_object()) throw std::runtime_error("invalid_lease");
@@ -554,9 +592,15 @@ void Store::load() {
         }
     }
     bool dirty = !exists;
+    if (!loaded.contains("trash")) { loaded["trash"] = Json::array(); dirty = true; }
+    if (!loaded.contains("preferences")) { loaded["preferences"] = default_preferences(); dirty = true; }
+    const auto defaults = default_preferences();
+    for (const auto& [key, value] : defaults.items()) {
+        if (!loaded["preferences"].contains(key)) { loaded["preferences"][key] = value; dirty = true; }
+    }
     // Tags are additive in schema 1. Preserve old notes and their timestamps
     // while making the field available consistently to UI and CLI readers.
-    for (auto& note : loaded["notes"]) {
+    for (const auto* collection : {"notes", "trash"}) for (auto& note : loaded[collection]) {
         auto tags = note_tags(note);
         if (!note.contains("tags") || note["tags"] != tags) {
             note["tags"] = std::move(tags);
@@ -612,6 +656,12 @@ bool Store::expire_locked() {
                 break;
             }
         }
+    }
+    if (!due && !state_["trash"].empty()) {
+        const auto cutoff = now - state_["preferences"]["trash_retention_days"].get<std::int64_t>() * day_ms;
+        due = std::any_of(state_["trash"].begin(), state_["trash"].end(), [&](const Json& note) {
+            return note["deleted_at"].get<std::int64_t>() <= cutoff;
+        });
     }
     if (!due) return false;
     auto previous = state_;
@@ -690,7 +740,7 @@ Json Store::handle(const Json& command, bool trusted_ui) {
             }
         } else {
             if (expire_locked()) events.push_back(event("updated"));
-            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message"});
+            const bool may_mutate = !is_one_of(op, {"snapshot", "status", "list", "request.result", "job.result", "note.get", "note.find_message", "note.trash.list"});
             Json previous = may_mutate ? state_ : Json();
             bool dirty = false;
             Json notification;
@@ -698,12 +748,27 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                 const auto now = now_ms();
                 if (op == "snapshot") {
                     Json snapshot = Json::object();
-                    for (const auto* field : {"schema", "requests", "jobs", "tasks", "lease"})
+                    for (const auto* field : {"schema", "requests", "jobs", "tasks", "lease", "preferences"})
                         snapshot[field] = state_[field];
                     snapshot["notes"] = Json::array();
                     for (const auto& note : state_["notes"])
                         snapshot["notes"].push_back(note_view(note, true));
+                    snapshot["trash"] = Json::array();
+                    for (const auto& note : state_["trash"])
+                        snapshot["trash"].push_back(note_view(note, true));
                     result = {{"ok", true}, {"state", std::move(snapshot)}};
+                } else if (op == "preferences.update") {
+                    if (!trusted_ui) throw std::runtime_error("forbidden: GUI settings required");
+                    auto preferences = state_["preferences"];
+                    for (const auto* field : {"saved_replies", "busy_until", "trash_retention_days"})
+                        if (command.contains(field)) preferences[field] = command[field];
+                    validate_preferences(preferences);
+                    dirty = state_["preferences"] != preferences;
+                    state_["preferences"] = std::move(preferences);
+                    dirty = expire_records(state_, now) || dirty;
+                    result = {{"ok", true}, {"preferences", state_["preferences"]}};
+                    notification = event("updated");
+                    notification["operation"] = op;
                 } else if (op == "status") {
                     const auto count_status = [&](const char* collection, const char* status) {
                         const auto& records = state_[collection];
@@ -717,6 +782,35 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                               {"notes", state_["notes"].size()}, {"lease", state_["lease"]}};
                 } else if (op == "list") {
                     result = list_records(state_, command);
+                } else if (op == "note.trash.list") {
+                    auto list = command;
+                    list["collection"] = "trash";
+                    result = list_records(state_, list);
+                } else if (op == "note.restore") {
+                    const auto id = id_field(command);
+                    const auto active = std::find_if(state_["notes"].begin(), state_["notes"].end(),
+                        [&](const Json& note) { return note["id"] == id; });
+                    if (active != state_["notes"].end()) result = {{"ok", true}, {"note", note_view(*active)}};
+                    else {
+                        auto& trash = state_["trash"];
+                        auto note = find_record(trash, id);
+                        note.erase("deleted_at");
+                        state_["notes"].push_back(note);
+                        trash.erase(std::find_if(trash.begin(), trash.end(), [&](const Json& item) { return item["id"] == id; }));
+                        result = {{"ok", true}, {"note", note_view(note)}};
+                        notification = event("updated", &note);
+                        notification["operation"] = op;
+                        dirty = true;
+                    }
+                } else if (op == "note.purge") {
+                    if (!trusted_ui) throw std::runtime_error("forbidden: GUI deletion required");
+                    const auto id = id_field(command);
+                    auto& trash = state_["trash"];
+                    notification = event("updated", &find_record(trash, id));
+                    notification["operation"] = op;
+                    trash.erase(std::find_if(trash.begin(), trash.end(), [&](const Json& item) { return item["id"] == id; }));
+                    result = {{"ok", true}};
+                    dirty = true;
                 } else if (op == "job.result") {
                     result = {{"ok", true}, {"job", find_record(state_["jobs"], id_field(command))}};
                 } else if (op == "note.get") {
@@ -892,6 +986,8 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     const bool task = op == "task.add";
                     auto& records = state_[task ? "tasks" : "notes"];
                     room_for_record(records);
+                    if (!task && records.size() + state_["trash"].size() >= max_records)
+                        throw std::runtime_error("history_limit_reached");
                     Json record = {{"id", make_id()}, {"title", text_field(command, "title", 160, true)},
                         {"body", text_field(command, "body", 64000)}, {"created_at", now}, {"updated_at", now}};
                     if (task) {
@@ -933,9 +1029,14 @@ Json Store::handle(const Json& command, bool trusted_ui) {
                     const auto id = id_field(command);
                     const auto& record = find_record(records, id);
                     notification = event("updated", &record);
-                    if (op == "note.delete") notification["operation"] = op;
+                    if (op == "note.delete") {
+                        auto deleted = record;
+                        deleted["deleted_at"] = now;
+                        state_["trash"].push_back(std::move(deleted));
+                        notification["operation"] = op;
+                        result = {{"ok", true}, {"note", note_view(state_["trash"].back())}};
+                    } else result = {{"ok", true}};
                     records.erase(std::find_if(records.begin(), records.end(), [&](const Json& item) { return item["id"] == id; }));
-                    result = {{"ok", true}};
                     dirty = true;
                 } else if (op == "item.dismiss") {
                     const auto kind = text_field(command, "kind", 16, true);

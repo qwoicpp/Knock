@@ -755,6 +755,130 @@ void cancellation_and_archiving() {
     ok(f.store.handle({{"op", "item.dismiss"}, {"kind", "request"}, {"id", item["id"]}}));
     check(f.store.snapshot()["requests"][0]["archived"] == true, "request not archived");
 }
+
+void preferences_are_validated_and_gui_owned() {
+    Fixture f;
+    const auto defaults = f.store.snapshot()["preferences"];
+    check(defaults["saved_replies"].size() == 3 && defaults["busy_until"] == 0 &&
+          defaults["trash_retention_days"] == 30, "wrong preference defaults");
+    const auto busy_until = knock::now_ms() + 900000;
+    fails(f.store.handle({{"op", "preferences.update"}, {"busy_until", busy_until}}), "forbidden");
+    const auto saved = ok(f.store.handle({{"op", "preferences.update"}, {"busy_until", busy_until},
+        {"saved_replies", {"Not now — 日本語", "Run headless tests.\nAsk later."}}}, true))["preferences"];
+    check(saved["busy_until"] == busy_until && saved["trash_retention_days"] == 30,
+          "partial preferences did not preserve unrelated values");
+    const auto pending = request(f.store);
+    check(pending["status"] == "pending" && f.store.snapshot()["lease"].is_null(),
+          "busy preferences answered or approved an agent");
+    Json excessive = Json::array();
+    for (int index = 0; index < 13; ++index) excessive.push_back("Reply");
+    const std::vector<Json> invalid = {
+        {{"busy_until", -1}}, {{"busy_until", 1.5}}, {{"trash_retention_days", 0}},
+        {{"trash_retention_days", 366}}, {{"saved_replies", "not an array"}},
+        {{"saved_replies", {" "}}}, {{"saved_replies", {std::string(2001, 'x')}}},
+        {{"saved_replies", {std::string("\xff", 1)}}}, {{"saved_replies", excessive}}
+    };
+    for (auto command : invalid) {
+        command["op"] = "preferences.update";
+        fails(f.store.handle(command, true));
+        check(f.store.snapshot()["preferences"] == saved, "invalid preferences partially saved");
+    }
+    ok(f.store.handle({{"op", "preferences.update"}, {"trash_retention_days", 7}}, true));
+    const auto before = f.store.snapshot();
+    f.store.stop();
+    Store restarted(f.directory);
+    restarted.load();
+    check(restarted.snapshot() == before, "preferences did not survive restart");
+    const auto cleared = ok(restarted.handle({{"op", "preferences.update"},
+        {"saved_replies", Json::array()}, {"busy_until", 0}}, true))["preferences"];
+    check(cleared["saved_replies"].empty() && cleared["busy_until"] == 0 &&
+          cleared["trash_retention_days"] == 7, "could not disable busy mode and remove saved replies");
+}
+
+void note_trash_restore_and_purge() {
+    Fixture f;
+    const auto note = ok(f.store.handle({{"op", "note.add"}, {"title", "Websites 日本語"},
+        {"body", "Personal bookmarks"}, {"tags", {"Personal", "Reference"}}}))["note"];
+    const auto id = note["id"];
+    ok(f.store.handle({{"op", "note.append"}, {"id", id}, {"text", "https://example.test"},
+        {"images", {"saved-image.png"}}, {"client_id", std::string(32, 'a')}}));
+    const auto original = ok(f.store.handle({{"op", "note.get"}, {"id", id}}))["note"];
+    const auto deleted = ok(f.store.handle({{"op", "note.delete"}, {"id", id}}))["note"];
+    check(deleted["deleted_at"].is_number_integer() && deleted["message_count"] == 1,
+          "delete omitted restorable metadata");
+    check(f.store.snapshot()["notes"].empty() && f.store.snapshot()["trash"].size() == 1,
+          "deleted note remained active or was lost");
+    fails(f.store.handle({{"op", "note.get"}, {"id", id}}), "not_found");
+    fails(f.store.handle({{"op", "note.append"}, {"id", id}, {"text", "must not revive"}}), "not_found");
+    const auto listed = ok(f.store.handle({{"op", "note.trash.list"}, {"limit", 1}}));
+    check(listed["items"][0] == deleted && listed["total"] == 1 && listed["next_offset"].is_null(),
+          "trash list did not return note metadata");
+    f.store.stop();
+    Store restarted(f.directory);
+    restarted.load();
+    ok(restarted.handle({{"op", "note.restore"}, {"id", id}}));
+    ok(restarted.handle({{"op", "note.restore"}, {"id", id}}));
+    check(restarted.snapshot()["trash"].empty(), "restored note remained in trash");
+    check(ok(restarted.handle({{"op", "note.get"}, {"id", id}}))["note"] == original,
+          "restore changed IDs, message content, attachments, tags, or timestamps");
+    fails(restarted.handle({{"op", "note.purge"}, {"id", id}}, true), "not_found");
+    ok(restarted.handle({{"op", "note.delete"}, {"id", id}}));
+    fails(restarted.handle({{"op", "note.purge"}, {"id", id}}), "forbidden");
+    ok(restarted.handle({{"op", "note.purge"}, {"id", id}}, true));
+    check(restarted.snapshot()["trash"].empty(), "permanent deletion failed");
+    fails(restarted.handle({{"op", "note.restore"}, {"id", id}}), "not_found");
+}
+
+void trash_retention_migration_and_rollback() {
+    Fixture f;
+    auto active = ok(f.store.handle({{"op", "note.add"}, {"title", "Keep active"}}))["note"];
+    auto old = ok(f.store.handle({{"op", "note.add"}, {"title", "Old deleted note"}}))["note"];
+    auto recent = ok(f.store.handle({{"op", "note.add"}, {"title", "Recently deleted"}}))["note"];
+    ok(f.store.handle({{"op", "note.delete"}, {"id", old["id"]}}));
+    ok(f.store.handle({{"op", "note.delete"}, {"id", recent["id"]}}));
+    f.store.stop();
+    const auto path = f.directory / "state.json";
+    auto disk = Json::parse(read_file(path));
+    constexpr std::int64_t day = 86400000;
+    disk["trash"][0]["deleted_at"] = knock::now_ms() - 31 * day;
+    disk["trash"][1]["deleted_at"] = knock::now_ms() - 2 * day;
+    write_file(path, disk.dump());
+    Store restarted(f.directory);
+    restarted.load();
+    check(restarted.snapshot()["trash"].size() == 1 && restarted.snapshot()["notes"][0]["id"] == active["id"],
+          "retention did not limit cleanup to expired trash");
+    const auto before = restarted.snapshot();
+    const auto saved = f.directory / "saved.json";
+    std::filesystem::rename(path, saved);
+    std::filesystem::create_directory(path);
+    fails(restarted.handle({{"op", "preferences.update"}, {"trash_retention_days", 1}}, true));
+    fails(restarted.handle({{"op", "note.delete"}, {"id", active["id"]}}));
+    fails(restarted.handle({{"op", "note.restore"}, {"id", recent["id"]}}));
+    fails(restarted.handle({{"op", "note.purge"}, {"id", recent["id"]}}, true));
+    check(restarted.snapshot() == before, "failed save changed preferences, active notes, or trash");
+    std::filesystem::remove(path);
+    std::filesystem::rename(saved, path);
+    ok(restarted.handle({{"op", "preferences.update"}, {"trash_retention_days", 1}}, true));
+    check(restarted.snapshot()["trash"].empty(), "shorter retention did not apply transactionally");
+    restarted.stop();
+    auto legacy = Json::parse(read_file(path));
+    legacy.erase("trash");
+    legacy.erase("preferences");
+    write_file(path, legacy.dump());
+    Store migrated(f.directory);
+    migrated.load();
+    check(migrated.snapshot()["trash"].empty() && migrated.snapshot()["preferences"]["trash_retention_days"] == 30 &&
+          migrated.snapshot()["notes"][0]["id"] == active["id"], "old state did not migrate without changing notes");
+    migrated.stop();
+    auto corrupt = Json::parse(read_file(path));
+    corrupt["preferences"]["saved_replies"] = {42};
+    const auto contents = corrupt.dump();
+    write_file(path, contents);
+    Store rejected(f.directory);
+    bool threw = false;
+    try { rejected.load(); } catch (...) { threw = true; }
+    check(threw && read_file(path) == contents, "invalid stored preferences were overwritten");
+}
 } // namespace
 
 int main() {
@@ -781,7 +905,10 @@ int main() {
         {"durable reentrant callbacks", callbacks_are_durable_and_reentrant},
         {"disk failure rollback", failed_save_rolls_back},
         {"corrupt state preservation", corruption_is_preserved},
-        {"cancellation and archiving", cancellation_and_archiving}
+        {"cancellation and archiving", cancellation_and_archiving},
+        {"GUI preferences validation and persistence", preferences_are_validated_and_gui_owned},
+        {"note trash restore and permanent deletion", note_trash_restore_and_purge},
+        {"trash retention, migration, and save rollback", trash_retention_migration_and_rollback}
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {
