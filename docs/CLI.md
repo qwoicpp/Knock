@@ -30,7 +30,7 @@ knock request --chat AUDIO-1 --message "Permission to use mouse and keyboard for
 
 This opens a request in the tray inbox and sends a native Windows notification unless banners are quiet. The command normally sleeps waiting for a reply from the tray; the model does not need to keep calling it. The default request timeout is 30 minutes. `--timeout` accepts 1–86400 seconds; `--lease` accepts 1–3600 seconds, with a five-minute default.
 
-While presence is Away or Busy, the ordinary request command returns immediately with the queued request, current `presence`, `wait_reason: "presence"`, and exit code `7`. The same applies when presence changes to Away or Busy while this command is waiting. The request remains pending with its original ID and expiry; it can still be answered later. Retain that ID, follow any relevant scheduling message, and continue independent work or end the turn instead of polling. At PC and an unset status preserve the normal waiting behavior.
+While presence is Away or Busy, a still-pending ordinary request returns immediately with the queued request, current `presence`, `wait_reason: "presence"`, and exit code `7`. The same applies when presence changes to Away or Busy while this command is waiting. An answer or expiry takes precedence over presence. An early pending result keeps its original ID and expiry and can still be answered later. Retain that ID, follow any relevant scheduling message, and continue independent work or end the turn instead of polling. At PC and an unset status preserve the normal waiting behavior.
 
 Yes produces an `approved` result. No produces `denied`. A typed reply produces `custom` with the exact reply text in `response`. A custom reply never grants desktop input automatically.
 

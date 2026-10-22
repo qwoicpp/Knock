@@ -58,7 +58,7 @@ Right-click anywhere in the popup and choose **Settings** to make it yours:
 You can also open Settings or quit Knock from the tray menu.
 
 **Settings → More** has saved replies, a quiet timer, and how long deleted notes
-stay in Trash. Right-click anywhere and choose **Quiet for...** to quiet banners
+stay in Trash. Right-click anywhere and choose **Quiet notifications...** to quiet banners
 for 15 minutes, 30 minutes, or an hour. Requests still wait in the inbox and keep
 their normal expiry. When the timer ends, Knock sends one inbox summary.
 
@@ -78,9 +78,10 @@ want, and press **SAVE**. I use things like “Out for coffee” or “In a meet
 headless tests are fine.” The first run says **SET STATUS** until you pick one.
 
 Agents get the status with their requests. While Away or Busy, a normal request
-stays in the inbox but returns immediately with the status and message, so the
-agent can do other work. A request already waiting does the same when the
-status changes to Away or Busy. Returning to At PC doesn't answer any requests
+that's still pending stays in the inbox but returns immediately with the status
+and message, so the agent can do other work. A pending request already waiting
+does the same when the status changes to Away or Busy. An answer or expiry takes
+precedence. Returning to At PC doesn't answer any requests
 or restart a chat; the usual Yes/No/Custom buttons still decide what happens.
 
 This is a manual setting. It survives restarting Knock and stays as set until

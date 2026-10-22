@@ -14,9 +14,10 @@ knock request --chat AUDIO-1 --message "May I use the mouse and keyboard for int
 ```
 
 This command normally waits for a reply from the tray. When presence is `away`
-or `busy`, it queues the request and returns immediately with `pending`, exit
-code `7`, and `wait_reason: "presence"`. A waiting request also returns that way
-if presence changes to Away or Busy. Retain the request ID and read the
+or `busy`, it queues the request and, if still pending, returns immediately with
+`pending`, exit code `7`, and `wait_reason: "presence"`. A pending request already
+waiting also returns that way if presence changes to Away or Busy. An answer or
+expiry takes precedence. Retain the request ID and read the
 `presence.message`; continue independent work or end the turn. Do not create a
 duplicate request or poll for a return to At PC.
 
