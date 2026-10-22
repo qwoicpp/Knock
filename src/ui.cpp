@@ -624,11 +624,19 @@ private:
         if (selected == 3) { toggle_startup(); layout(); }
         if (selected == 4) ShellExecuteW(window_, L"open", data_directory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if (selected == 5 && settings_open_) close_settings();
-        if (selected == 5 && save_detail()) {
+        if (selected == 5) {
+            if (!save_detail()) {
+                show();
+                if (title_edit_) SetFocus(title_edit_);
+                return;
+            }
             quitting_ = true;
             DestroyWindow(window_);
             return;
         }
+        // A newly opened popup needs to keep focus. Returning it to the tray
+        // here would immediately deactivate and hide an ordinary tray open.
+        if (IsWindowVisible(window_) || selected == 4) return;
         NOTIFYICONDATAW data{};
         data.cbSize = sizeof(data);
         data.hWnd = window_;
