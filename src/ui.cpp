@@ -139,6 +139,7 @@ public:
         const bool settings_loaded = window_settings_.initialize();
         recover_completions();
         snapshot_ = store_.snapshot();
+        busy_was_active_ = busy_deadline() > 0;
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.hInstance = instance_;
@@ -189,12 +190,9 @@ public:
             if (message.message == WM_KEYDOWN && (message.hwnd == window_ || IsChild(window_, message.hwnd))) {
                 if (message.wParam == VK_ESCAPE) { escape(); continue; }
                 if (note_keys(message.hwnd, message.wParam)) continue;
+                if (settings_keys(message.hwnd, message.wParam)) continue;
                 if (message.wParam == VK_RETURN && message.hwnd == footer_edit_) { add_item(); continue; }
                 if (message.wParam == VK_RETURN && message.hwnd == tag_query_edit_) { activate_tag_query(); continue; }
-                if (message.wParam == VK_RETURN && settings_open_ &&
-                    (message.hwnd == settings_width_edit_ || message.hwnd == settings_height_edit_)) {
-                    apply_window_size(); continue;
-                }
                 if (message.hwnd == composer_edit_ &&
                     ((message.wParam == 'V' && GetKeyState(VK_CONTROL) < 0) ||
                      (message.wParam == VK_INSERT && GetKeyState(VK_SHIFT) < 0))) {
@@ -219,6 +217,7 @@ private:
     enum class Tab { notifications, tasks, notes };
     enum class Detail { none, task, note };
     enum class SaveIntent { explicit_action, background };
+    enum class SettingsPage { general, preferences, replies, reply };
     enum class NotePage { list, find, remove };
     enum class Icon { none, tasks, notifications, notes };
     struct Button {
@@ -232,11 +231,12 @@ private:
         bool card = false;
         bool left_aligned = false;
         bool note_result = false;
+        bool bare = false;
         Icon icon = Icon::none;
         Json record;
     };
     struct Row { Json item; bool request; int top; int height; int message_height; int tail_height; };
-    struct Banner { std::string id; std::wstring title; std::wstring text; };
+    struct Banner { std::string id; std::wstring title; std::wstring text; bool inbox = false; };
     struct NoteRow { std::size_t index; int top; int height; int text_height; };
     struct NoteDraft { std::string text; std::vector<std::string> images; std::string client_id; };
     struct MenuItem {
@@ -279,6 +279,11 @@ private:
     HWND settings_return_focus_ = nullptr;
     HWND settings_width_edit_ = nullptr;
     HWND settings_height_edit_ = nullptr;
+    HWND settings_retention_edit_ = nullptr;
+    HWND settings_reply_edit_ = nullptr;
+    SettingsPage settings_page_ = SettingsPage::general;
+    int saved_reply_index_ = -1;
+    int saved_reply_offset_ = 0;
     HWND footer_edit_ = nullptr;
     HWND title_edit_ = nullptr;
     HWND body_edit_ = nullptr;
@@ -329,6 +334,11 @@ private:
     std::string reply_id_;
     std::string reply_draft_;
     std::map<std::string, std::string> drafts_;
+    std::string inbox_chat_;
+    int inbox_bar_y_ = 0;
+    int busy_bar_y_ = 0;
+    bool busy_was_active_ = false;
+    std::int64_t busy_completed_deadline_ = 0;
     int scroll_[3]{};
     int content_height_ = 0;
     int viewport_height_ = 0;
@@ -362,7 +372,7 @@ private:
         small_font_ = make(10, FW_NORMAL);
         title_font_ = make(13, FW_NORMAL);
         for (HWND edit : {footer_edit_, title_edit_, body_edit_, operator_edit_, project_edit_, reply_edit_, tag_query_edit_, composer_edit_,
-                          settings_width_edit_, settings_height_edit_, note_query_edit_})
+                          settings_width_edit_, settings_height_edit_, settings_retention_edit_, settings_reply_edit_, note_query_edit_})
             if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(body_font_), TRUE);
     }
     void text(HDC dc, const std::wstring& value, RECT bounds, HFONT font,
@@ -395,6 +405,119 @@ private:
             feedback(error == "input_busy" ? L"Input is already in use. Release it first." : widen(error));
         }
         return result;
+    }
+    const Json& preferences() const {
+        static const Json empty = Json::object();
+        const auto found = snapshot_.find("preferences");
+        return found != snapshot_.end() && found->is_object() ? *found : empty;
+    }
+    std::int64_t busy_deadline() const { return preferences().value("busy_until", std::int64_t(0)); }
+    bool busy() const { return busy_deadline() > now_ms(); }
+    std::wstring busy_caption() const {
+        const auto minutes = std::max<std::int64_t>(1, (busy_deadline() - now_ms() + 59999) / 60000);
+        return L"BUSY · " + std::to_wstring(minutes) + L"m remaining";
+    }
+    bool save_preferences(Json changes) {
+        changes["op"] = "preferences.update";
+        const auto result = mutate(std::move(changes));
+        if (!result.value("ok", false)) return false;
+        snapshot_["preferences"] = result.at("preferences");
+        return true;
+    }
+    void quiet_banners() {
+        banners_.clear();
+        active_banner_.reset();
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = window_;
+        data.uID = 1;
+        data.uFlags = NIF_INFO; // An empty szInfo removes an existing banner.
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+    void busy_summary() {
+        snapshot_ = store_.snapshot();
+        std::size_t requests = 0, results = 0;
+        for (const auto& request : snapshot_["requests"])
+            if (!request.value("archived", false) && get_string(request, "status") == "pending") ++requests;
+        for (const auto& job : snapshot_["jobs"])
+            if (!job.value("archived", false) && get_string(job, "status") != "running") ++results;
+        Banner summary;
+        summary.inbox = true;
+        summary.title = L"Knock - busy timer finished";
+        summary.text = std::to_wstring(requests) + L" pending request(s), " + std::to_wstring(results) +
+            L" finished result(s) in the inbox.";
+        banners_.push_back(std::move(summary));
+        if (!active_banner_) next_banner();
+    }
+    void update_busy_mode() {
+        const bool active = busy();
+        if (active && !busy_was_active_) quiet_banners();
+        if (!active && busy_was_active_) {
+            busy_was_active_ = false;
+            const auto deadline = busy_deadline();
+            if (deadline && busy_completed_deadline_ != deadline) {
+                busy_completed_deadline_ = deadline;
+                // Persist completion so a later restart does not announce it again.
+                save_preferences({{"busy_until", 0}});
+            }
+            busy_summary();
+        }
+        if (active != busy_was_active_) {
+            busy_was_active_ = active;
+            layout();
+        }
+        if (!active && busy_bar_y_) layout();
+        update_tray();
+    }
+    void set_busy_minutes(int minutes) {
+        const bool previous = busy_was_active_;
+        if (!save_preferences({{"busy_until", minutes ? now_ms() + std::int64_t(minutes) * 60000 : 0}})) return;
+        busy_completed_deadline_ = 0;
+        busy_was_active_ = previous;
+        update_busy_mode();
+        layout();
+    }
+    void busy_menu(POINT point) {
+        const std::vector<MenuItem> items{{31, L"Busy for 15 minutes"}, {32, L"Busy for 30 minutes"},
+            {33, L"Busy for 1 hour"}, {34, L"End busy mode", busy()}};
+        const int selected = popup_menu(point, items);
+        if (selected >= 31 && selected <= 34) {
+            const int minutes[]{15, 30, 60, 0};
+            set_busy_minutes(minutes[selected - 31]);
+        }
+    }
+    void open_busy_menu() {
+        POINT point{};
+        GetCursorPos(&point);
+        busy_menu(point);
+    }
+    void select_inbox_chat(std::string chat) {
+        inbox_chat_ = std::move(chat);
+        scroll_[static_cast<int>(Tab::notifications)] = 0;
+        layout();
+    }
+    void inbox_chat_menu() {
+        std::map<std::string, std::size_t> chats;
+        for (const auto* collection : {"requests", "jobs"}) {
+            for (const auto& item : snapshot_[collection]) {
+                if (item.value("archived", false)) continue;
+                auto& pending = chats[get_string(item, "chat")];
+                if (std::string_view(collection) == "requests" && get_string(item, "status") == "pending") ++pending;
+            }
+        }
+        std::vector<MenuItem> items{{1, L"All chats"}, {0, L"", false, true}};
+        std::vector<std::string> labels;
+        for (const auto& [chat, count] : chats) {
+            labels.push_back(chat);
+            items.push_back({static_cast<UINT>(labels.size() + 1),
+                L"@" + shortened(chat, 40) + L"  (" + std::to_wstring(count) + L" pending)"});
+        }
+        POINT point{};
+        GetCursorPos(&point);
+        const int selected = popup_menu(point, items);
+        if (selected == 1) select_inbox_chat({});
+        else if (selected >= 2 && static_cast<std::size_t>(selected - 2) < labels.size())
+            select_inbox_chat(labels[static_cast<std::size_t>(selected - 2)]);
     }
     void recover_completions() {
         auto directory = data_directory() / L"completions";
@@ -434,11 +557,13 @@ private:
         data.uID = 1;
         data.uFlags = NIF_TIP;
         auto tip = pending ? L"Knock - " + std::to_wstring(pending) + L" pending request(s)" : L"Knock - agent inbox";
+        if (busy()) tip += L" - " + busy_caption();
         wcsncpy_s(data.szTip, tip.c_str(), _TRUNCATE);
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
     void next_banner() {
         active_banner_.reset();
+        if (busy()) { banners_.clear(); return; }
         if (banners_.empty()) return;
         active_banner_ = std::move(banners_.front());
         banners_.pop_front();
@@ -454,6 +579,7 @@ private:
         if (!Shell_NotifyIconW(NIM_MODIFY, &data)) active_banner_.reset();
     }
     void enqueue_banner(const Json& event) {
+        if (busy()) return;
         Banner banner;
         banner.id = get_string(event, "id");
         banner.title = L"@" + widen(get_string(event, "chat")) + L" - " +
@@ -486,18 +612,19 @@ private:
         if (has_tray && tray.right <= info.rcWork.left) x = info.rcWork.left + px(8);
         SetWindowPos(window_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
     }
-    void show(const std::string& focus_id = {}, bool pinned = false) {
+    void show(const std::string& focus_id = {}, bool pinned = false, bool inbox = false) {
         if (!IsWindowVisible(window_)) keep_open_ = pinned;
         else if (pinned) keep_open_ = true;
         recover_completions();
         bool title_needs_attention = false;
-        if (!focus_id.empty()) {
+        if (!focus_id.empty() || inbox) {
             if (settings_open_) close_settings();
             if (!save_detail()) title_needs_attention = true;
             else {
                 detail_ = Detail::none;
                 destroy_detail_edits();
                 tab_ = Tab::notifications;
+                inbox_chat_.clear();
             }
         }
         position_popup();
@@ -618,12 +745,14 @@ private:
         GetCursorPos(&point);
         const std::vector<MenuItem> items{
             {1, L"Open Knock"}, {2, L"Settings..."},
+            {6, busy() ? busy_caption() : L"Busy for..."},
             {3, startup_enabled() ? L"[x] Start with Windows" : L"[ ] Start with Windows"},
             {4, L"Open data folder"}, {0, L"", false, true}, {5, L"Quit"}
         };
         int selected = popup_menu(point, items);
         if (selected == 1) show();
         if (selected == 2) { show(); open_settings(); }
+        if (selected == 6) busy_menu(point);
         if (selected == 3) { toggle_startup(); layout(); }
         if (selected == 4) ShellExecuteW(window_, L"open", data_directory().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if (selected == 5 && settings_open_) close_settings();
@@ -651,6 +780,7 @@ private:
         if (!save_detail(SaveIntent::background)) return;
         settings_return_focus_ = GetFocus();
         settings_open_ = true;
+        settings_page_ = SettingsPage::general;
         settings_width_edit_ = make_edit(content_, 41, false, L"Width");
         settings_height_edit_ = make_edit(content_, 42, false, L"Height");
         for (HWND edit : {settings_width_edit_, settings_height_edit_}) {
@@ -659,22 +789,126 @@ private:
         }
         SetWindowTextW(settings_width_edit_, std::to_wstring(window_settings_.size().width).c_str());
         SetWindowTextW(settings_height_edit_, std::to_wstring(window_settings_.size().height).c_str());
+        settings_retention_edit_ = make_edit(content_, 43, false, L"Days");
+        SetWindowLongPtrW(settings_retention_edit_, GWL_STYLE,
+            GetWindowLongPtrW(settings_retention_edit_, GWL_STYLE) | ES_NUMBER);
+        SendMessageW(settings_retention_edit_, EM_SETLIMITTEXT, 3, 0);
+        SetWindowTextW(settings_retention_edit_, std::to_wstring(preferences().value("trash_retention_days", 30)).c_str());
         feedback_.clear();
         layout();
         SetFocus(settings_width_edit_);
     }
     void close_settings() {
         if (!settings_open_) return;
-        for (HWND* edit : {&settings_width_edit_, &settings_height_edit_}) {
+        for (HWND* edit : {&settings_width_edit_, &settings_height_edit_, &settings_retention_edit_, &settings_reply_edit_}) {
             if (*edit) DestroyWindow(*edit);
             *edit = nullptr;
         }
         settings_open_ = false;
+        settings_page_ = SettingsPage::general;
         feedback_.clear();
         layout();
         SetFocus(IsWindow(settings_return_focus_) && IsWindowVisible(settings_return_focus_)
             ? settings_return_focus_ : window_);
         settings_return_focus_ = nullptr;
+    }
+    void settings_page(SettingsPage page) {
+        if (settings_reply_edit_ && page != SettingsPage::reply) {
+            DestroyWindow(settings_reply_edit_);
+            settings_reply_edit_ = nullptr;
+        }
+        settings_page_ = page;
+        feedback_.clear();
+        layout();
+        SetFocus(page == SettingsPage::general ? settings_width_edit_ :
+            page == SettingsPage::preferences ? settings_retention_edit_ : window_);
+    }
+    void settings_back() {
+        if (settings_page_ == SettingsPage::reply) settings_page(SettingsPage::replies);
+        else if (settings_page_ == SettingsPage::replies) settings_page(SettingsPage::preferences);
+        else if (settings_page_ == SettingsPage::preferences) settings_page(SettingsPage::general);
+        else close_settings();
+    }
+    std::vector<std::string> saved_replies() const {
+        return preferences().value("saved_replies", std::vector<std::string>{});
+    }
+    static std::wstring reply_caption(const std::string& value, std::size_t limit = 64) {
+        auto caption = shortened(value, limit);
+        for (auto& ch : caption) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+        return caption;
+    }
+    void edit_saved_reply(int index) {
+        const auto replies = saved_replies();
+        if (index >= static_cast<int>(replies.size()) || (index < 0 && replies.size() >= 12)) return;
+        saved_reply_index_ = index;
+        settings_page_ = SettingsPage::reply;
+        if (!settings_reply_edit_) settings_reply_edit_ = make_edit(content_, 44, true, L"Write a reply you use often...");
+        SendMessageW(settings_reply_edit_, EM_SETLIMITTEXT, 2000, 0);
+        SetWindowTextW(settings_reply_edit_, index < 0 ? L"" : widen(replies[static_cast<std::size_t>(index)]).c_str());
+        feedback_.clear();
+        layout();
+        SetFocus(settings_reply_edit_);
+    }
+    void save_saved_reply() {
+        if (!settings_reply_edit_) return;
+        const auto value = narrow(edit_text(settings_reply_edit_));
+        if (trim(value).empty()) { feedback(L"Write a reply before saving."); return; }
+        if (value.size() > 2000) { feedback(L"This reply is too long (maximum 2,000 UTF-8 bytes)."); return; }
+        auto replies = saved_replies();
+        if (saved_reply_index_ < 0) replies.push_back(value);
+        else if (static_cast<std::size_t>(saved_reply_index_) < replies.size())
+            replies[static_cast<std::size_t>(saved_reply_index_)] = value;
+        else { feedback(L"That saved reply was removed. Go back and add it again."); return; }
+        if (!save_preferences({{"saved_replies", replies}})) return;
+        settings_page(SettingsPage::replies);
+        feedback(L"Reply saved.");
+    }
+    void delete_saved_reply() {
+        auto replies = saved_replies();
+        if (saved_reply_index_ < 0 || static_cast<std::size_t>(saved_reply_index_) >= replies.size()) return;
+        replies.erase(replies.begin() + saved_reply_index_);
+        if (!save_preferences({{"saved_replies", replies}})) return;
+        settings_page(SettingsPage::replies);
+        feedback(L"Reply removed.");
+    }
+    void use_saved_reply() {
+        if (!reply_edit_) return;
+        const auto replies = saved_replies();
+        std::vector<MenuItem> items;
+        for (std::size_t i = 0; i < replies.size(); ++i)
+            items.push_back({static_cast<UINT>(i + 1), reply_caption(replies[i])});
+        if (items.empty()) items.push_back({0, L"No saved replies yet", false});
+        items.push_back({0, L"", false, true});
+        items.push_back({100, L"Manage saved replies..."});
+        RECT bounds{};
+        GetWindowRect(reply_edit_, &bounds);
+        const int selected = popup_menu(POINT{bounds.left, bounds.top}, items);
+        if (selected == 100) {
+            open_settings();
+            if (settings_open_) settings_page(SettingsPage::replies);
+        } else if (selected > 0 && static_cast<std::size_t>(selected) <= replies.size() && IsWindow(reply_edit_)) {
+            SetWindowTextW(reply_edit_, widen(replies[static_cast<std::size_t>(selected - 1)]).c_str());
+            drafts_[reply_id_] = replies[static_cast<std::size_t>(selected - 1)];
+            SetFocus(reply_edit_);
+            SendMessageW(reply_edit_, EM_SETSEL, -1, -1);
+        }
+    }
+    void apply_trash_retention() {
+        const auto value = edit_text(settings_retention_edit_);
+        if (value.empty() || value.find_first_not_of(L"0123456789") != std::wstring::npos) {
+            feedback(L"Enter a retention period from 1 to 365 days."); return;
+        }
+        const int days = std::stoi(value);
+        if (days < 1 || days > 365) { feedback(L"Keep deleted notes for 1 to 365 days."); return; }
+        if (save_preferences({{"trash_retention_days", days}})) feedback(L"Trash retention saved.");
+    }
+    bool settings_keys(HWND target, WPARAM key) {
+        if (!settings_open_ || key != VK_RETURN) return false;
+        if (target == settings_width_edit_ || target == settings_height_edit_) apply_window_size();
+        else if (target == settings_retention_edit_) apply_trash_retention();
+        else if (target == settings_reply_edit_ && GetKeyState(VK_CONTROL) < 0) save_saved_reply();
+        else return false;
+        return true;
     }
     void configure_hotkey() {
         const bool previous_menu = context_menu_;
@@ -1375,7 +1609,8 @@ private:
             GetWindowRect(source, &bounds);
             point = POINT{bounds.left + px(12), bounds.top + px(12)};
         }
-        std::vector<MenuItem> items{{1, L"Settings...", !settings_open_}, {2, L"Hide Knock"}};
+        std::vector<MenuItem> items{{1, L"Settings...", !settings_open_}, {2, L"Hide Knock"},
+            {3, busy() ? busy_caption() : L"Busy for..."}};
         wchar_t class_name[16]{};
         GetClassNameW(source, class_name, 16);
         const bool editor = lstrcmpiW(class_name, L"Edit") == 0;
@@ -1416,6 +1651,7 @@ private:
         const int selected = popup_menu(point, items);
         if (selected == 1) open_settings();
         if (selected == 2) hide();
+        if (selected == 3) busy_menu(point);
         if (selected >= 10 && selected <= 14 && IsWindow(source)) {
             SetFocus(source);
             const UINT commands[]{EM_UNDO, WM_CUT, WM_COPY, WM_PASTE, EM_SETSEL};
@@ -1594,7 +1830,7 @@ private:
             color = button.active || button.hover ? foreground : muted;
             draw_tab_icon(item.hDC, button.icon, px(compact_tab ? 8 : 12), (bounds.bottom - px(14)) / 2, color);
         } else fill(item.hDC, bounds, bg);
-        if (!button.tab) outline(item.hDC, bounds, button.hover || (item.itemState & ODS_FOCUS) ? muted : border);
+        if (!button.tab && !button.bare) outline(item.hDC, bounds, button.hover || (item.itemState & ODS_FOCUS) ? muted : border);
         if (button.note_result) {
             const bool deleting = note_page_ == NotePage::remove;
             text(item.hDC, widen(get_string(button.record, "title")),
@@ -1635,9 +1871,9 @@ private:
             }
         } else {
             if (terminal_tab) { bounds.left = px(compact_tab ? 29 : 33); bounds.right -= px(compact_tab ? 6 : 8); }
-            else if (button.left_aligned) { bounds.left = px(8); bounds.right -= px(8); }
+            else if (button.left_aligned && !button.bare) { bounds.left = px(8); bounds.right -= px(8); }
             else InflateRect(&bounds, -px(3), 0);
-            text(item.hDC, button.label, bounds, button.tab && !terminal_tab ? small_font_ : body_font_, color,
+            text(item.hDC, button.label, bounds, button.bare ? title_font_ : button.tab && !terminal_tab ? small_font_ : body_font_, color,
                  (terminal_tab || button.left_aligned ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
         if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
@@ -1674,6 +1910,22 @@ private:
                 if (!snapshot_["lease"].is_null()) mutate({{"op", "request.release"}, {"id", snapshot_["lease"]["id"]}});
             });
             top += px(28);
+        }
+        busy_bar_y_ = 0;
+        if (busy() && !settings_open_) {
+            busy_bar_y_ = top;
+            button("busy-end", window_, L"END", rect(width - px(65), top, px(53), px(20)),
+                   [this] { set_busy_minutes(0); });
+            top += px(28);
+        }
+        inbox_bar_y_ = 0;
+        if (!settings_open_ && tab_ == Tab::notifications && detail_ == Detail::none) {
+            inbox_bar_y_ = top;
+            button("inbox-chats", window_, L"CHATS", rect(px(12), top, px(64), px(22)),
+                   [this] { inbox_chat_menu(); });
+            if (!inbox_chat_.empty()) button("inbox-all", window_, L"ALL CHATS", rect(width - px(100), top, px(88), px(22)),
+                   [this] { select_inbox_chat({}); });
+            top += px(31);
         }
         bool footer = !settings_open_ && tab_ != Tab::notifications && detail_ == Detail::none && !note_page_visible();
         notes_bar_y_ = 0;
@@ -1742,7 +1994,54 @@ private:
     }
     void layout_settings(RECT area) {
         content_height_ = area.bottom;
-        button("settings-back", content_, L"< BACK", rect(0, px(2), px(68), px(22)), [this] { close_settings(); });
+        for (HWND edit : {settings_width_edit_, settings_height_edit_})
+            if (edit) ShowWindow(edit, settings_page_ == SettingsPage::general ? SW_SHOW : SW_HIDE);
+        if (settings_retention_edit_) ShowWindow(settings_retention_edit_, settings_page_ == SettingsPage::preferences ? SW_SHOW : SW_HIDE);
+        if (settings_reply_edit_) ShowWindow(settings_reply_edit_, settings_page_ == SettingsPage::reply ? SW_SHOW : SW_HIDE);
+        button("settings-back", content_, L"< BACK", rect(0, px(2), px(68), px(22)), [this] { settings_back(); });
+        if (settings_page_ == SettingsPage::preferences) {
+            button("settings-replies", content_, L"MANAGE", rect(area.right - px(82), px(53), px(82), px(23)),
+                   [this] { settings_page(SettingsPage::replies); });
+            button("settings-busy", content_, busy() ? L"CHANGE" : L"SET TIMER", rect(area.right - px(82), px(111), px(82), px(23)),
+                   [this] { open_busy_menu(); });
+            MoveWindow(settings_retention_edit_, px(1), px(196), px(63), px(24), FALSE);
+            ShowWindow(settings_retention_edit_, SW_SHOW);
+            button("settings-retention", content_, L"APPLY", rect(area.right - px(82), px(195), px(82), px(25)),
+                   [this] { apply_trash_retention(); });
+            return;
+        }
+        if (settings_page_ == SettingsPage::replies) {
+            const auto replies = saved_replies();
+            button("settings-reply-add", content_, L"ADD", rect(area.right - px(60), px(2), px(60), px(22)),
+                   [this] { edit_saved_reply(-1); }, replies.size() < 12);
+            const int visible = std::max(1, (static_cast<int>(area.bottom) - px(113)) / px(38));
+            saved_reply_offset_ = std::clamp(saved_reply_offset_, 0, std::max(0, static_cast<int>(replies.size()) - visible));
+            for (int row = 0; row < visible && row + saved_reply_offset_ < static_cast<int>(replies.size()); ++row) {
+                const int index = row + saved_reply_offset_;
+                const auto key = "settings-reply:" + std::to_string(index);
+                button(key, content_, reply_caption(replies[static_cast<std::size_t>(index)], 160),
+                    rect(0, px(69) + row * px(38), area.right, px(31)), [this, index] { edit_saved_reply(index); });
+                buttons_.at(button_keys_.at(key)).left_aligned = true;
+            }
+            button("settings-reply-previous", content_, L"< PREV", rect(0, area.bottom - px(29), px(74), px(23)),
+                   [this, visible] { saved_reply_offset_ -= visible; layout(); }, saved_reply_offset_ > 0);
+            button("settings-reply-next", content_, L"NEXT >", rect(area.right - px(74), area.bottom - px(29), px(74), px(23)),
+                   [this, visible] { saved_reply_offset_ += visible; layout(); }, saved_reply_offset_ + visible < static_cast<int>(replies.size()));
+            return;
+        }
+        if (settings_page_ == SettingsPage::reply) {
+            MoveWindow(settings_reply_edit_, px(2), px(67), area.right - px(12), std::max(px(64), static_cast<int>(area.bottom) - px(136)), FALSE);
+            ShowWindow(settings_reply_edit_, SW_SHOW);
+            button("settings-reply-save", content_, L"SAVE", rect(0, area.bottom - px(29), px(62), px(23)),
+                   [this] { save_saved_reply(); });
+            button("settings-reply-cancel", content_, L"CANCEL", rect(px(70), area.bottom - px(29), px(72), px(23)),
+                   [this] { settings_page(SettingsPage::replies); });
+            if (saved_reply_index_ >= 0) button("settings-reply-delete", content_, L"DELETE", rect(area.right - px(72), area.bottom - px(29), px(72), px(23)),
+                   [this] { delete_saved_reply(); });
+            return;
+        }
+        button("settings-more", content_, L"MORE >", rect(area.right - px(76), px(2), px(76), px(22)),
+               [this] { settings_page(SettingsPage::preferences); });
         button("settings-hotkey", content_, L"CHANGE", rect(area.right - px(82), px(62), px(82), px(23)),
                [this] { configure_hotkey(); });
         const int field_width = (area.right - px(104)) / 2;
@@ -1758,8 +2057,45 @@ private:
                rect(0, px(252), area.right, px(23)), [this] { toggle_startup(); layout(); });
     }
     void draw_settings(HDC dc, RECT area) {
-        text(dc, L"SETTINGS", RECT{px(82), px(2), area.right, px(24)}, title_font_, foreground,
+        const auto heading = settings_page_ == SettingsPage::general ? L"SETTINGS" :
+            settings_page_ == SettingsPage::preferences ? L"PREFERENCES" :
+            settings_page_ == SettingsPage::replies ? L"SAVED REPLIES" : saved_reply_index_ < 0 ? L"NEW REPLY" : L"EDIT REPLY";
+        text(dc, heading, RECT{px(82), px(2), area.right - px(settings_page_ == SettingsPage::general ? 82 : settings_page_ == SettingsPage::replies ? 66 : 0), px(24)}, title_font_, foreground,
              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        fill(dc, RECT{0, px(34), area.right, px(34) + 1}, border);
+        if (settings_page_ == SettingsPage::preferences) {
+            text(dc, L"SAVED REPLIES", RECT{0, px(43), area.right - px(94), px(62)}, small_font_, muted, DT_SINGLELINE);
+            text(dc, std::to_wstring(saved_replies().size()) + L" replies", RECT{0, px(65), area.right - px(94), px(84)}, body_font_, foreground, DT_SINGLELINE);
+            text(dc, L"BUSY TIMER", RECT{0, px(101), area.right - px(94), px(120)}, small_font_, muted, DT_SINGLELINE);
+            text(dc, busy() ? busy_caption() : L"Banners are on", RECT{0, px(124), area.right - px(94), px(144)}, small_font_, foreground, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(dc, L"KEEP DELETED NOTES", RECT{0, px(169), area.right, px(187)}, small_font_, muted, DT_SINGLELINE);
+            outline(dc, rect(0, px(195), px(66), px(27)), border);
+            text(dc, L"days (1-365)", RECT{px(76), px(196), area.right - px(93), px(221)}, small_font_, subdued, DT_SINGLELINE | DT_VCENTER);
+            const bool showing_feedback = !feedback_.empty() && GetTickCount64() < feedback_until_;
+            text(dc, showing_feedback ? feedback_ : L"Older Trash entries are removed when applied.",
+                 RECT{0, px(237), area.right, area.bottom}, small_font_, showing_feedback ? orange : subdued,
+                 DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+            return;
+        }
+        if (settings_page_ == SettingsPage::replies) {
+            const bool showing_feedback = !feedback_.empty() && GetTickCount64() < feedback_until_;
+            text(dc, showing_feedback ? feedback_ : L"Click a reply to edit it. Up to 12 replies.",
+                 RECT{0, px(43), area.right, px(64)}, small_font_, showing_feedback ? orange : muted,
+                 DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (saved_replies().empty()) text(dc, L"No saved replies yet. Choose ADD to create one.",
+                RECT{px(6), px(85), area.right - px(6), px(143)}, body_font_, muted);
+            return;
+        }
+        if (settings_page_ == SettingsPage::reply) {
+            text(dc, L"This fills the reply box; SEND submits it.", RECT{0, px(43), area.right, px(63)}, small_font_, muted,
+                 DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            outline(dc, RECT{0, px(65), area.right, area.bottom - px(67)}, border);
+            draw_editor_scroll(dc, settings_reply_edit_);
+            const bool showing_feedback = !feedback_.empty() && GetTickCount64() < feedback_until_;
+            text(dc, showing_feedback ? feedback_ : L"Ctrl+Enter to save", RECT{0, area.bottom - px(57), area.right, area.bottom - px(34)},
+                 small_font_, showing_feedback ? orange : subdued, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            return;
+        }
         for (int y : {34, 126, 242}) fill(dc, RECT{0, px(y), area.right, px(y) + 1}, border);
         text(dc, L"HOTKEY", RECT{0, px(43), area.right, px(60)}, small_font_, muted, DT_SINGLELINE | DT_NOPREFIX);
         text(dc, hotkey_.label(), RECT{0, px(62), area.right - px(94), px(85)}, body_font_, foreground,
@@ -1919,9 +2255,15 @@ private:
         rows_.clear();
         row_tops_.clear();
         std::vector<std::pair<Json, bool>> ordered;
-        for (const auto& item : snapshot_["requests"]) if (!item.value("archived", false)) ordered.emplace_back(item, true);
-        for (const auto& item : snapshot_["jobs"]) if (!item.value("archived", false)) ordered.emplace_back(item, false);
+        auto matches = [this](const Json& item) {
+            return !item.value("archived", false) && (inbox_chat_.empty() || get_string(item, "chat") == inbox_chat_);
+        };
+        for (const auto& item : snapshot_["requests"]) if (matches(item)) ordered.emplace_back(item, true);
+        for (const auto& item : snapshot_["jobs"]) if (matches(item)) ordered.emplace_back(item, false);
         std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+            const bool pending_a = a.second && get_string(a.first, "status") == "pending";
+            const bool pending_b = b.second && get_string(b.first, "status") == "pending";
+            if (pending_a != pending_b) return pending_a;
             return a.first.value("created_at", std::int64_t(0)) > b.first.value("created_at", std::int64_t(0));
         });
         int text_x = px(128);
@@ -1936,7 +2278,7 @@ private:
                 auto status = get_string(item, "status");
                 if (status == "pending") {
                     height = px(28) + message_height + px(35);
-                    if (get_string(item, "id") == reply_id_) height += px(113);
+                    if (get_string(item, "id") == reply_id_) height += px(142);
                 } else {
                     auto response = shortened(get_string(item, "response"), 800);
                     tail_height = text_height(response, text_width, small_font_, 0);
@@ -1960,6 +2302,12 @@ private:
             auto status = get_string(row.item, "status");
             int row_y = row.top - scroll();
             int actions_y = row_y + px(25) + row.message_height + px(7);
+            auto chat = get_string(row.item, "chat");
+            button(id + "chat", content_, L"@" + widen(chat), rect(text_x, row_y, text_width - px(91), px(21)),
+                   [this, chat] { select_inbox_chat(chat); });
+            auto& chat_button = buttons_.at(button_keys_.at(id + "chat"));
+            chat_button.bare = true;
+            chat_button.left_aligned = true;
             if (row.request && status == "pending") {
                 int gap = px(6);
                 int small_width = (text_width - gap * 2) / 3;
@@ -1969,10 +2317,12 @@ private:
                 button(id + "custom", content_, L"CUSTOM", rect(text_x + (small_width + gap) * 2, actions_y, small_width, px(21)), [this, id] { begin_reply(id); });
                 if (id == reply_id_ && reply_edit_) {
                     reply_found = true;
-                    MoveWindow(reply_edit_, text_x + px(1), actions_y + px(32), text_width - px(10), px(65), FALSE);
+                    button(id + "saved-replies", content_, L"SAVED REPLIES", rect(text_x, actions_y + px(31), text_width, px(21)),
+                           [this] { use_saved_reply(); });
+                    MoveWindow(reply_edit_, text_x + px(1), actions_y + px(61), text_width - px(10), px(65), FALSE);
                     ShowWindow(reply_edit_, SW_SHOW);
-                    button(id + "send", content_, L"SEND", rect(text_x, actions_y + px(103), px(70), px(21)), [this] { send_reply(); });
-                    button(id + "cancel", content_, L"CANCEL", rect(text_x + px(76), actions_y + px(103), px(70), px(21)), [this] { cancel_reply(); });
+                    button(id + "send", content_, L"SEND", rect(text_x, actions_y + px(132), px(70), px(21)), [this] { send_reply(); });
+                    button(id + "cancel", content_, L"CANCEL", rect(text_x + px(76), actions_y + px(132), px(70), px(21)), [this] { cancel_reply(); });
                 }
             } else if (row.request) {
                 if (status == "approved" && get_string(row.item, "kind") == "input")
@@ -2002,6 +2352,12 @@ private:
             text(dc, label, RECT{px(12), px(45), area.right - px(87), px(65)}, small_font_, orange,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
+        if (busy_bar_y_) text(dc, busy_caption(),
+            RECT{px(12), busy_bar_y_, area.right - px(74), busy_bar_y_ + px(20)}, small_font_, muted,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (inbox_bar_y_) text(dc, inbox_chat_.empty() ? L"All chats · pending first" : L"@" + widen(inbox_chat_),
+            RECT{px(85), inbox_bar_y_, area.right - px(inbox_chat_.empty() ? 12 : 108), inbox_bar_y_ + px(22)},
+            small_font_, muted, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         if (notes_bar_y_) {
             auto label = untagged_filter_ ? L"Untagged" : note_filter_.empty() ? L"All notes" : L"# " + widen(note_filter_);
             text(dc, label, RECT{px(85), notes_bar_y_, area.right - px(75), notes_bar_y_ + px(22)}, body_font_, muted,
@@ -2212,8 +2568,8 @@ private:
     void draw_notifications(HDC dc, RECT area) {
         if (rows_.empty()) {
             request_sprite_.draw(dc, rect(px(8), px(22), px(90), px(75)));
-            text(dc, L"No requests yet.", RECT{px(121), px(27), area.right - px(8), px(52)}, title_font_);
-            text(dc, L"Your agents can ask here.\n\nUse knock request from a terminal.",
+            text(dc, inbox_chat_.empty() ? L"No requests yet." : L"Nothing in this chat.", RECT{px(121), px(27), area.right - px(8), px(52)}, title_font_);
+            text(dc, inbox_chat_.empty() ? L"Your agents can ask here.\n\nUse knock info for instructions." : L"Choose All chats to see the rest of your inbox.",
                  RECT{px(121), px(58), area.right - px(8), px(135)}, body_font_, muted);
             return;
         }
@@ -2227,9 +2583,6 @@ private:
             const Sprite& sprite = row.request ? (get_string(row.item, "kind") == "question" ? note_sprite_ : request_sprite_) : complete_sprite_;
             sprite.draw(dc, rect(px(3), y + px(5), px(108), px(103)));
             int time_width = px(83);
-            text(dc, L"@" + widen(get_string(row.item, "chat")),
-                RECT{text_x, y + px(2), area.right - time_width - px(10), y + px(19)}, title_font_, foreground,
-                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             text(dc, display_time(row.item.value("created_at", std::int64_t(0))),
                 RECT{area.right - time_width - px(8), y + px(2), area.right - px(8), y + px(19)}, small_font_, muted,
                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -2248,7 +2601,7 @@ private:
                     text(dc, response, rect(text_x, actions_y + px(19), text_width, std::max(0, row.height - row.message_height - px(95))),
                          small_font_, foreground, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
                 } else if (id == reply_id_) {
-                    outline(dc, rect(text_x, actions_y + px(31), text_width, px(67)), border);
+                    outline(dc, rect(text_x, actions_y + px(60), text_width, px(67)), border);
                     draw_editor_scroll(dc, reply_edit_);
                 }
             } else if (status == "running") {
@@ -2306,7 +2659,7 @@ private:
         layout();
     }
     void escape() {
-        if (settings_open_) close_settings();
+        if (settings_open_) settings_back();
         else if (tag_picker_open_) close_tag_picker();
         else if (detail_ == Detail::note && note_metadata_open_) open_note_metadata();
         else if (reply_edit_ && tab_ == Tab::notifications) cancel_reply();
@@ -2316,6 +2669,7 @@ private:
     }
     void changed(const Json& event) {
         snapshot_ = store_.snapshot();
+        update_busy_mode();
         bool follow_note = false;
         if (detail_ != Detail::none) {
             const auto& records = snapshot_[detail_ == Detail::task ? "tasks" : "notes"];
@@ -2372,7 +2726,7 @@ private:
                 if (action) action();
             }
         }
-        if ((event == EN_UPDATE || event == EN_VSCROLL) && (id == 32 || id == 35 || id == 37))
+        if ((event == EN_UPDATE || event == EN_VSCROLL) && (id == 32 || id == 35 || id == 37 || id == 44))
             InvalidateRect(content_, nullptr, FALSE);
         if (event == EN_CHANGE && !populating_ && id >= 31 && id <= 34) {
             detail_dirty_ = true;
@@ -2454,7 +2808,7 @@ private:
                     SetCapture(content_);
                     return 0;
                 }
-                for (HWND editor : {body_edit_, reply_edit_, composer_edit_}) {
+                for (HWND editor : {body_edit_, reply_edit_, composer_edit_, settings_reply_edit_}) {
                     if (editor_gutter(editor, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam))) {
                         dragging_editor_ = editor;
                         SetCapture(content_);
@@ -2539,7 +2893,8 @@ private:
             } else if (event == WM_CONTEXTMENU) context_menu();
             else if (event == NIN_BALLOONUSERCLICK) {
                 auto id = active_banner_ ? active_banner_->id : std::string();
-                show(id);
+                const bool inbox = active_banner_ && active_banner_->inbox;
+                show(id, false, inbox);
                 next_banner();
             } else if (event == NIN_BALLOONTIMEOUT || event == NIN_BALLOONHIDE) next_banner();
             return 0;
@@ -2561,6 +2916,11 @@ private:
         case WM_TIMER:
             if (wparam == 1) {
                 store_.tick();
+                update_busy_mode();
+                if (busy() && IsWindowVisible(window_)) {
+                    InvalidateRect(window_, nullptr, FALSE);
+                    if (settings_open_) InvalidateRect(content_, nullptr, FALSE);
+                }
                 if (active_banner_ && GetTickCount64() - banner_started_ > 60000) next_banner();
                 if (!feedback_.empty() && GetTickCount64() >= feedback_until_) {
                     feedback_.clear(); InvalidateRect(content_, nullptr, FALSE);
@@ -2624,7 +2984,7 @@ private:
         if (message == WM_CHAR && wparam == 0x16 && window == app->composer_edit_) {
             SendMessageW(window, WM_PASTE, 0, 0); return 0;
         }
-        if (message == WM_MOUSEWHEEL && (window == app->body_edit_ || window == app->reply_edit_ || window == app->composer_edit_)) {
+        if (message == WM_MOUSEWHEEL && (window == app->body_edit_ || window == app->reply_edit_ || window == app->composer_edit_ || window == app->settings_reply_edit_)) {
             SendMessageW(window, EM_LINESCROLL, 0, -GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * 3);
             InvalidateRect(app->content_, nullptr, FALSE);
             return 0;
@@ -2632,15 +2992,12 @@ private:
         if (message == WM_KEYDOWN) {
             if (wparam == VK_ESCAPE) { app->escape(); return 0; }
             if (app->note_keys(window, wparam)) return 0;
+            if (app->settings_keys(window, wparam)) return 0;
             if (wparam == VK_INSERT && GetKeyState(VK_SHIFT) < 0 && window == app->composer_edit_) {
                 SendMessageW(window, WM_PASTE, 0, 0); return 0;
             }
             if (wparam == VK_RETURN && window == app->footer_edit_) { app->add_item(); return 0; }
             if (wparam == VK_RETURN && window == app->tag_query_edit_) { app->activate_tag_query(); return 0; }
-            if (wparam == VK_RETURN && app->settings_open_ &&
-                (window == app->settings_width_edit_ || window == app->settings_height_edit_)) {
-                app->apply_window_size(); return 0;
-            }
             if (wparam == VK_RETURN && window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0) {
                 app->send_note_message(); return 0;
             }
@@ -2652,6 +3009,7 @@ private:
         if (message == WM_CHAR && (wparam == VK_ESCAPE || (wparam == VK_RETURN &&
             (window == app->footer_edit_ || window == app->tag_query_edit_ || window == app->note_query_edit_ ||
              window == app->settings_width_edit_ || window == app->settings_height_edit_ || GetKeyState(VK_CONTROL) < 0 ||
+             window == app->settings_retention_edit_ ||
              (window == app->composer_edit_ && GetKeyState(VK_SHIFT) >= 0))))) return 0;
         return DefSubclassProc(window, message, wparam, lparam);
     }
