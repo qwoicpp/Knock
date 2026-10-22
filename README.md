@@ -16,7 +16,7 @@ not. I'll keep changing it as I use it.
 
 ## What it looks like
 
-![The request inbox](docs/screenshots/inbox.png)
+![The request inbox with Away status](docs/screenshots/presence-inbox.png)
 
 ![A personal note conversation](docs/screenshots/note-conversation.png)
 
@@ -74,8 +74,9 @@ lives separately, so your notes and tasks stay put.
 
 Click the status beneath the tabs, or choose **Status...** from the right-click
 or tray menu. Pick **At PC**, **Away**, or **Busy**, add a short message if you
-want, and press **SAVE**. I use things like “Out for coffee” or “In a meeting;
-headless tests are fine.” The first run says **SET STATUS** until you pick one.
+want, and press **SAVE**. Something like “Out for coffee” or “In a meeting;
+headless tests are fine” is enough. The first run says **SET STATUS** until you
+pick one.
 
 Agents get the status with their requests. While Away or Busy, a normal request
 that's still pending stays in the inbox but returns immediately with the status
@@ -87,6 +88,8 @@ or restart a chat; the usual Yes/No/Custom buttons still decide what happens.
 This is a manual setting. It survives restarting Knock and stays as set until
 you change it. It doesn't guess from mouse activity. The quiet timer is
 separate: it only silences notification banners.
+
+![Setting availability and a short message](docs/screenshots/presence.png)
 
 ### Notes
 

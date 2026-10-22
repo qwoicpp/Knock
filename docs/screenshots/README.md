@@ -4,7 +4,14 @@ These are screenshots of the actual Windows executable running under Wine 9.0
 in a private virtual desktop. They show test records used for verification;
 those records are not included in the portable release.
 
-The version-0.3 captures are:
+Version 0.6 adds these captures at the default 420 × 510 size:
+
+| File | View |
+| --- | --- |
+| `presence.png` | Manual At PC / Away / Busy selection and an optional message |
+| `presence-inbox.png` | Saved Away status beside pending requests and a completed build |
+
+The earlier view set includes:
 
 | File | View |
 | --- | --- |

@@ -156,6 +156,7 @@ if(WIN32)
         docs/screenshots/note-find.png docs/screenshots/settings.png
         docs/screenshots/saved-replies.png docs/screenshots/note-entry-edit.png
         docs/screenshots/note-trash.png docs/screenshots/preferences.png
+        docs/screenshots/presence.png docs/screenshots/presence-inbox.png
         DESTINATION docs/screenshots)
     install(FILES third_party/nlohmann-LICENSE.txt DESTINATION licenses)
 endif()
